@@ -536,6 +536,12 @@ select {
     padding: 6px 8px;
     max-width: 45vw;
 }
+select:disabled {
+    color: #b3b9c0;
+    background: #f0f2f4;
+    cursor: not-allowed;
+    opacity: 0.6;
+}
 .sep {
     width: 1px;
     align-self: stretch;
@@ -627,6 +633,10 @@ main {
         background: #282923;
         border-color: #4a4b45;
     }
+    select:disabled {
+        color: #6b6d66;
+        background: #23241f;
+    }
     button.icon:not(:disabled):hover {
         background: #33342d;
     }
@@ -706,7 +716,7 @@ main {
             <button type="button" class="icon" id="font-increase" title="Larger text" aria-label="Larger text">+</button>
         </div>
         <span class="grow"></span>
-        <select id="output-mode" aria-label="Output format">
+        <select id="output-mode" aria-label="Output format"${meta.createdAt == null ? ' disabled' : ''}>
             <option value="" selected disabled>Output&hellip;</option>
             <option value=".txt">Plain text</option>
             <option value=".base64">Base64</option>
@@ -802,6 +812,10 @@ main {
 
     function updateSaveState() {
         saveButton.disabled = textarea.value === content;
+    }
+
+    function updateOutputState() {
+        outputMode.disabled = meta.createdAt == null;
     }
 
     var gutterLineHeight = 0;
@@ -921,14 +935,21 @@ main {
             if (request.readyState === 4 && request.status >= 200 && request.status < 300) {
                 try {
                     var data = JSON.parse(request.responseText);
-                    if (data && data.updated_at != null) {
+                    if (data && data.deleted) {
+                        meta.createdAt = null;
+                        meta.updatedAt = null;
+                        meta.expiresAt = null;
+                        showSavedAt(null);
+                        updateOutputState();
+                    } else if (data && data.updated_at != null) {
                         meta.createdAt = data.created_at;
                         meta.updatedAt = data.updated_at;
                         meta.expiresAt = data.expires_at;
                         showSavedAt(data.updated_at);
+                        updateOutputState();
                     }
                 } catch (err) {
-                    // Non-JSON responses (for example a delete) are expected.
+                    // Non-JSON responses are ignored.
                 }
             }
             if (onDone) onDone();
@@ -1068,6 +1089,7 @@ main {
     showSavedAt(meta.updatedAt);
     pickExpiry();
     updateSaveState();
+    updateOutputState();
     updateGutter();
     initFontSize();
     textarea.focus();
