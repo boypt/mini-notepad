@@ -3,6 +3,12 @@
 A small web notepad. It runs on [Cloudflare Workers](https://developers.cloudflare.com/workers/).
 It stores notes in a [D1](https://developers.cloudflare.com/d1/) database.
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/boypt/mini-notepad)
+
+Click the button to copy this project and deploy it to your own Cloudflare
+account. Cloudflare makes the D1 database for you. After the first deploy,
+apply the database schema once (see [Setup](#setup)).
+
 ## Features
 
 - Simple text editing in the browser.
