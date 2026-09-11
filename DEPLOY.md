@@ -41,7 +41,9 @@ Cron Trigger └─ 每天 03:00 UTC 调用 scheduled 清理过期行
 ```
 
 - **一个 Worker + 一个 D1 数据库 + 一个 Cron Trigger**，无其他依赖。
-- 笔记正文以 **zstd** 压缩后写入 D1 的 `content`（BLOB），`content_encoding` 记录编码。
+- 笔记正文写入 D1 的 `content`（BLOB）：小于 128 字节存为明文
+  （`content_encoding = 'identity'`），其余用 **zstd** 压缩
+  （`content_encoding = 'zstd'`）。
 - 表结构含 `created_at` / `updated_at` / `expires_at`，以及预留的密码列
   （`is_protected` / `password_hash` / `password_salt` / `password_algo`）。
 - 应用假定部署在**站点根路径**（重定向与 favicon 使用 `/<id>`、`/favicon.ico`）。
@@ -114,10 +116,10 @@ curl -s -D - -o /dev/null http://127.0.0.1:8787/
 echo hello | curl --data-binary @- http://127.0.0.1:8787/cli-test
 curl http://127.0.0.1:8787/cli-test            # hello
 
-# 输出模式
-curl http://127.0.0.1:8787/cli-test/plain
-curl http://127.0.0.1:8787/cli-test/base64     # aGVsbG8=
-curl http://127.0.0.1:8787/cli-test/md5        # 5d41402abc4b2a76b9719d911017c592
+# 输出模式（文件名后缀）
+curl http://127.0.0.1:8787/cli-test.txt          # hello
+curl http://127.0.0.1:8787/cli-test.base64       # aGVsbG8=
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/index.jsp   # 400
 
 # 追加
 echo " world" | curl --data-binary @- http://127.0.0.1:8787/cli-test/append
@@ -215,9 +217,9 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "$BASE/"
 # 2. 写入 / 读取 / 模式
 echo hello | curl --data-binary @- "$BASE/smoke"
 curl "$BASE/smoke"          # hello
-curl "$BASE/smoke/plain"    # hello
-curl "$BASE/smoke/base64"   # aGVsbG8=
-curl "$BASE/smoke/md5"      # 5d41402abc4b2a76b9719d911017c592
+curl "$BASE/smoke.txt"      # hello
+curl "$BASE/smoke.base64"   # aGVsbG8=
+curl -s -o /dev/null -w '%{http_code}\n' "$BASE/index.jsp"   # 400
 curl -s -o /dev/null -w '%{content_type}\n' "$BASE/smoke/json"   # application/json
 
 # 3. 表单保存（模拟网页自动保存）
@@ -236,7 +238,8 @@ npx wrangler d1 execute minimalist-web-notepad --remote \
   --command "SELECT id, content_encoding, size_raw, size_stored, expires_at FROM notes LIMIT 5"
 ```
 
-浏览器侧：打开首页应重定向到随机 ID，输入内容约 1 秒后自动保存，刷新后仍在。
+浏览器侧：打开首页应重定向到随机 ID，输入内容约 60 秒后自动保存（也可点
+工具栏的保存按钮立即保存），刷新后仍在。
 
 ---
 
@@ -246,7 +249,7 @@ npx wrangler d1 execute minimalist-web-notepad --remote \
 
 | 配置 | 位置 | 说明 |
 | --- | --- | --- |
-| `NOTE_TTL_DAYS` | `[vars]` | 笔记有效期（天），默认 `30`；设为 `0` 表示永不过期 |
+| `NOTE_TTL_DAYS` | `[vars]` | CLI / 无 `expires` 字段时的默认有效期（天），默认 `30`；设为 `0` 表示永不过期。网页端以每篇笔记选择的过期时间为准 |
 | `crons` | `[triggers]` | GC 频率，默认 `["0 3 * * *"]`（每天 03:00 UTC） |
 | `compatibility_flags` | 顶层 | 需保留 `nodejs_compat`（zstd 依赖 `node:zlib`） |
 | `compatibility_date` | 顶层 | 需 ≥ `2024-09-23` 才能启用 `nodejs_compat` v2 |
@@ -263,8 +266,10 @@ Cloudflare 才会更新触发器。
 
 ### 过期策略说明
 
-每次写入都会刷新 `expires_at = now + NOTE_TTL_DAYS`，即“闲置即过期”。
-若希望“创建后固定过期”，可在迁移中调整或修改 `saveNote` 逻辑。
+网页端在底部状态栏选择过期时间（`24h` / `72h` / `1w` / `never`），保存时随
+`expires` 字段提交，每次写入都会按该值刷新 `expires_at`，即“闲置即过期”。
+CLI 写入不带该字段时回退为 `NOTE_TTL_DAYS`。若希望“创建后固定过期”，可在
+迁移中调整或修改 `saveNote` 逻辑。
 
 ---
 

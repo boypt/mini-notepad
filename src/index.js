@@ -7,18 +7,25 @@
  * Behavioural parity with the PHP version is intentional:
  *   - GET  /                     -> 302 redirect to a random 5-char note id
  *   - GET  /:note                -> HTML editor
- *   - GET  /:note/:mode          -> stored note in that mode
- *                                   (plain, base64, md5, mtime,
- *                                    html, css, js, json; unknown == raw)
+ *   - GET  /:note.txt            -> stored note as plain text
+ *   - GET  /:note.base64         -> stored note as base64
+ *   - GET  /:note/:mode          -> stored note in that mode (legacy; plain,
+ *                                    base64, mtime, html, css, js, json;
+ *                                    unknown == raw)
+ *   - unknown file suffix        -> 400
  *   - POST /:note  (form `text`) -> save; empty `text` deletes
  *   - POST /:note  (raw body)    -> CLI save
  *   - POST /:note/append         -> CLI append
  *   - curl user-agent            -> raw body, no HTML wrapper
  *
  * Differences from the PHP version:
- *   - Bodies are zstd-compressed (node:zlib) before they are written to D1.
+ *   - Bodies are zstd-compressed (node:zlib) before they are written to D1;
+ *     bodies shorter than 128 bytes are stored as plain UTF-8 instead
+ *     (content_encoding = 'identity').
  *   - Every row carries created_at / updated_at / expires_at; a Cron
  *     Trigger garbage-collects expired rows. Reads also lazily delete.
+ *   - The web editor offers a per-note expiry choice; CLI writes fall back
+ *     to NOTE_TTL_DAYS.
  *   - Password columns (password_hash / password_salt / password_algo /
  *     is_protected) are reserved for a future password-protected view.
  *     They are stored but not yet enforced.
@@ -36,6 +43,14 @@ const DEFAULT_TTL_DAYS = 30;
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** Codec recorded in notes.content_encoding. */
 const CODEC = 'zstd';
+/** Bodies shorter than this many UTF-8 bytes are stored uncompressed. */
+const PLAINTEXT_MAX_BYTES = 128;
+/** Expiry options offered by the web UI, as durations in milliseconds. */
+const EXPIRY_TOKENS = {
+  '24h': DAY_MS,
+  '72h': 3 * DAY_MS,
+  '1w': 7 * DAY_MS,
+};
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -66,9 +81,23 @@ function emptyOk() {
   });
 }
 
+function jsonOk(value) {
+  return new Response(JSON.stringify(value), {
+    status: 200,
+    headers: noStore({ 'Content-Type': 'application/json; charset=utf-8' }),
+  });
+}
+
 function notFound() {
   return new Response('Not found', {
     status: 404,
+    headers: noStore({ 'Content-Type': 'text/plain; charset=utf-8' }),
+  });
+}
+
+function badRequest() {
+  return new Response('Bad request', {
+    status: 400,
     headers: noStore({ 'Content-Type': 'text/plain; charset=utf-8' }),
   });
 }
@@ -94,6 +123,30 @@ export function randomNoteId(length = 5) {
  */
 export function compress(text) {
   return new Uint8Array(zlib.zstdCompressSync(encoder.encode(text)));
+}
+
+/**
+ * Pick the storage codec for a body: plain UTF-8 for short notes, zstd for the
+ * rest. Returns the bytes plus the metadata recorded in the notes row.
+ */
+export function encodeForStorage(text) {
+  const raw = encoder.encode(text);
+  if (raw.length < PLAINTEXT_MAX_BYTES) {
+    return { bytes: raw, encoding: 'identity', rawSize: raw.length };
+  }
+  return { bytes: new Uint8Array(zlib.zstdCompressSync(raw)), encoding: CODEC, rawSize: raw.length };
+}
+
+/**
+ * Map a web-UI expiry token to an `expires` argument for saveNote.
+ * `undefined` means "use NOTE_TTL_DAYS"; `null` means "never expires".
+ */
+export function resolveExpiryToken(token) {
+  if (token == null || token === '') return undefined;
+  if (token === 'never') return null;
+  return Object.prototype.hasOwnProperty.call(EXPIRY_TOKENS, token)
+    ? EXPIRY_TOKENS[token]
+    : undefined;
 }
 
 /**
@@ -144,107 +197,6 @@ function escapeHtml(value) {
 }
 
 // ---------------------------------------------------------------------------
-// MD5 (Web Crypto does not implement MD5)
-// ---------------------------------------------------------------------------
-
-const MD5_SHIFTS = [
-  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-  5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
-  4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-  6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-];
-
-const MD5_K = [
-  0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
-  0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
-  0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
-  0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-  0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
-  0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
-  0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
-  0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-  0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
-  0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-  0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
-  0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-  0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
-  0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-  0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
-  0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
-];
-
-function rotateLeft(x, n) {
-  return ((x << n) | (x >>> (32 - n))) >>> 0;
-}
-
-function wordToHexLE(word) {
-  let out = '';
-  for (let i = 0; i < 4; i++) out += ((word >>> (i * 8)) & 0xff).toString(16).padStart(2, '0');
-  return out;
-}
-
-/** MD5 of a string (UTF-8) or byte array, returned as lowercase hex. */
-export function md5(input) {
-  const message = typeof input === 'string' ? encoder.encode(input) : input;
-  const len = message.length;
-
-  const paddedLength = len + 1 + (((56 - ((len + 1) % 64)) + 64) % 64) + 8;
-  const bytes = new Uint8Array(paddedLength);
-  bytes.set(message);
-  bytes[len] = 0x80;
-
-  const view = new DataView(bytes.buffer);
-  const bitLength = len * 8;
-  view.setUint32(paddedLength - 8, bitLength >>> 0, true);
-  view.setUint32(paddedLength - 4, Math.floor(bitLength / 0x100000000) >>> 0, true);
-
-  let a0 = 0x67452301;
-  let b0 = 0xefcdab89;
-  let c0 = 0x98badcfe;
-  let d0 = 0x10325476;
-
-  for (let offset = 0; offset < paddedLength; offset += 64) {
-    const words = new Uint32Array(16);
-    for (let i = 0; i < 16; i++) words[i] = view.getUint32(offset + i * 4, true);
-
-    let a = a0;
-    let b = b0;
-    let c = c0;
-    let d = d0;
-
-    for (let i = 0; i < 64; i++) {
-      let f;
-      let g;
-      if (i < 16) {
-        f = (b & c) | (~b & d);
-        g = i;
-      } else if (i < 32) {
-        f = (d & b) | (~d & c);
-        g = (5 * i + 1) % 16;
-      } else if (i < 48) {
-        f = b ^ c ^ d;
-        g = (3 * i + 5) % 16;
-      } else {
-        f = c ^ (b | ~d);
-        g = (7 * i) % 16;
-      }
-      f = (f + a + MD5_K[i] + words[g]) >>> 0;
-      a = d;
-      d = c;
-      c = b;
-      b = (b + rotateLeft(f, MD5_SHIFTS[i])) >>> 0;
-    }
-
-    a0 = (a0 + a) >>> 0;
-    b0 = (b0 + b) >>> 0;
-    c0 = (c0 + c) >>> 0;
-    d0 = (d0 + d) >>> 0;
-  }
-
-  return [a0, b0, c0, d0].map(wordToHexLE).join('');
-}
-
-// ---------------------------------------------------------------------------
 // D1 note store
 // ---------------------------------------------------------------------------
 
@@ -259,7 +211,7 @@ async function deleteNote(env, id) {
  */
 async function loadNote(env, id) {
   const row = await env.DB.prepare(
-    `SELECT id, content, content_encoding, updated_at, expires_at, is_protected
+    `SELECT id, content, content_encoding, created_at, updated_at, expires_at, is_protected
        FROM notes WHERE id = ? LIMIT 1`,
   ).bind(id).first();
 
@@ -275,13 +227,24 @@ async function loadNote(env, id) {
 }
 
 /**
- * Insert or update a note. Content is always gzip-compressed before storage.
- * expires_at is (re)computed on every write; NOTE_TTL_DAYS = 0 disables expiry.
+ * Insert or update a note. Short bodies are stored as plain UTF-8; larger ones
+ * are zstd-compressed. expires_at is (re)computed on every write:
+ *   - `expires` as a number  -> now + that many ms
+ *   - `expires === null`     -> never expires
+ *   - `expires` undefined    -> NOTE_TTL_DAYS default (0 = never expires)
  */
-async function saveNote(env, id, text, { append = false } = {}) {
+async function saveNote(env, id, text, { append = false, expires } = {}) {
   const now = Date.now();
-  const ttlDays = Number(env.NOTE_TTL_DAYS ?? DEFAULT_TTL_DAYS);
-  const expiresAt = ttlDays > 0 ? now + ttlDays * DAY_MS : null;
+
+  let expiresAt;
+  if (expires === null) {
+    expiresAt = null;
+  } else if (typeof expires === 'number') {
+    expiresAt = now + expires;
+  } else {
+    const ttlDays = Number(env.NOTE_TTL_DAYS ?? DEFAULT_TTL_DAYS);
+    expiresAt = ttlDays > 0 ? now + ttlDays * DAY_MS : null;
+  }
 
   let body = text;
   if (append) {
@@ -290,8 +253,7 @@ async function saveNote(env, id, text, { append = false } = {}) {
     body = base + text;
   }
 
-  const compressed = compress(body);
-  const rawSize = encoder.encode(body).length;
+  const { bytes, encoding, rawSize } = encodeForStorage(body);
 
   await env.DB.prepare(
     `INSERT INTO notes
@@ -305,7 +267,7 @@ async function saveNote(env, id, text, { append = false } = {}) {
        size_stored      = excluded.size_stored,
        updated_at       = excluded.updated_at,
        expires_at       = excluded.expires_at`,
-  ).bind(id, compressed, CODEC, rawSize, compressed.byteLength, now, now, expiresAt).run();
+  ).bind(id, bytes, encoding, rawSize, bytes.byteLength, now, now, expiresAt).run();
 }
 
 /** Delete every row whose expiry has passed (used by the Cron Trigger). */
@@ -323,14 +285,25 @@ async function handlePost(request, env, id, mode) {
   const contentType = request.headers.get('content-type') || '';
   const raw = await request.text();
 
-  // Web (form) save path: the autosave XHR posts `text=...`.
+  // Web (form) save path: the autosave XHR posts `text=...` (and `expires=...`).
   if (contentType.includes('application/x-www-form-urlencoded')) {
     const params = new URLSearchParams(raw);
     if (params.has('text')) {
       const text = params.get('text') ?? '';
-      if (text.length === 0) await deleteNote(env, id);
-      else await saveNote(env, id, text);
-      return emptyOk();
+      if (text.length === 0) {
+        await deleteNote(env, id);
+        return jsonOk({ deleted: true });
+      }
+      const expires = resolveExpiryToken(params.get('expires'));
+      await saveNote(env, id, text, { expires });
+      const row = await env.DB.prepare(
+        'SELECT created_at, updated_at, expires_at FROM notes WHERE id = ? LIMIT 1',
+      ).bind(id).first();
+      return jsonOk({
+        created_at: row?.created_at ?? null,
+        updated_at: row?.updated_at ?? null,
+        expires_at: row?.expires_at ?? null,
+      });
     }
   }
 
@@ -350,8 +323,6 @@ function modeResponse(loaded, mode) {
       return new Response(text, { headers: headers(plain) });
     case 'base64':
       return new Response(bytesToBase64(encoder.encode(text)), { headers: headers(plain) });
-    case 'md5':
-      return new Response(md5(text), { headers: headers(plain) });
     case 'mtime':
       return new Response(String(Math.floor(loaded.row.updated_at / 1000)), {
         headers: headers(plain),
@@ -389,17 +360,24 @@ async function handleGet(request, env, ctx, id, mode) {
     });
   }
 
-  return new Response(renderPage(id, loaded ? loaded.text : ''), {
+  const meta = loaded
+    ? {
+        createdAt: loaded.row.created_at ?? null,
+        updatedAt: loaded.row.updated_at ?? null,
+        expiresAt: loaded.row.expires_at ?? null,
+      }
+    : { createdAt: null, updatedAt: null, expiresAt: null };
+  return new Response(renderPage(id, loaded ? loaded.text : '', meta), {
     status: 200,
     headers: noStore({ 'Content-Type': 'text/html; charset=utf-8' }),
   });
 }
 
 // ---------------------------------------------------------------------------
-// HTML template (CSS + JS inlined, same as the PHP app)
+// HTML template (CSS + JS inlined)
 // ---------------------------------------------------------------------------
 
-function renderPage(id, text) {
+export function renderPage(id, text, meta = {}) {
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -411,39 +389,108 @@ function renderPage(id, text) {
     <style>
 /*! Minimalist Web Notepad | https://github.com/pereorga/minimalist-web-notepad */
 
+*, *::before, *::after {
+    box-sizing: border-box;
+}
+html, body {
+    height: 100%;
+}
 body {
     margin: 0;
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
     background: #ebeef1;
+    color: #222;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
-.nav {
-    margin: 10px 20px;
-    font-size: small;
+.toolbar,
+.statusbar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
 }
-.nav a {
-    display: inline;
-    margin-right: 10px;
-    color: grey;
+.statusbar {
+    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+    font-size: 12px;
+    color: #66707a;
 }
-.container {
-    position: absolute;
-    top: 40px;
-    right: 20px;
-    bottom: 20px;
-    left: 20px;
+.grow {
+    flex: 1 1 auto;
+}
+button.icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    font-size: 18px;
+    line-height: 1;
+    color: inherit;
+    background: #fff;
+    border: 1px solid #d3d8de;
+    border-radius: 6px;
+    cursor: pointer;
+}
+button.icon:not(:disabled):hover {
+    background: #f2f4f7;
+}
+button.icon:not(:disabled):active {
+    transform: translateY(1px);
+}
+button.icon:disabled {
+    color: #b3b9c0;
+    background: #f0f2f4;
+    border-color: #e0e4e8;
+    cursor: not-allowed;
+    opacity: 0.5;
+    filter: grayscale(1);
+}
+#save-note:not(:disabled) {
+    color: #1f6feb;
+    border-color: #1f6feb;
+    background: #eaf2ff;
+}
+#save-note:not(:disabled):hover {
+    background: #dcebff;
+}
+button.icon:focus-visible,
+select:focus-visible,
+#content:focus-visible {
+    outline: 2px solid #5b8def;
+    outline-offset: 1px;
+}
+select {
+    font: inherit;
+    font-size: 13px;
+    color: inherit;
+    background: #fff;
+    border: 1px solid #d3d8de;
+    border-radius: 6px;
+    padding: 6px 8px;
+    max-width: 45vw;
+}
+main {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    padding: 0 12px;
 }
 #content {
-    font-size: 100%;
+    flex: 1 1 auto;
+    width: 100%;
     margin: 0;
-    padding: 20px;
+    padding: 16px;
+    font: inherit;
+    font-size: 100%;
     overflow-y: auto;
     resize: none;
-    width: 100%;
-    height: 100%;
-    min-height: 100%;
-    -webkit-box-sizing: border-box;
-    -moz-box-sizing: border-box;
-    box-sizing: border-box;
-    border: 1px #ddd solid;
+    border: 1px solid #d3d8de;
+    border-radius: 6px;
     outline: none;
 }
 #printable {
@@ -453,16 +500,50 @@ body {
 @media (prefers-color-scheme: dark) {
     body {
         background: #383934;
+        color: #f8f8f2;
+    }
+    button.icon,
+    select {
+        background: #282923;
+        border-color: #4a4b45;
+    }
+    button.icon:not(:disabled):hover {
+        background: #33342d;
+    }
+    button.icon:disabled {
+        color: #6b6d66;
+        background: #23241f;
+        border-color: #3a3b35;
+        opacity: 0.5;
+        filter: grayscale(1);
+    }
+    #save-note:not(:disabled) {
+        color: #7cb0ff;
+        border-color: #7cb0ff;
+        background: #1d2a3f;
+    }
+    #save-note:not(:disabled):hover {
+        background: #253652;
     }
     #content {
         background: #282923;
         color: #f8f8f2;
-        border: 0;
+        border-color: #4a4b45;
+    }
+    .statusbar {
+        color: #b6b7ae;
     }
 }
 
 @media print {
-    .container {
+    body {
+        display: block;
+        min-height: 0;
+        background: #fff;
+    }
+    .toolbar,
+    .statusbar,
+    main {
         display: none;
     }
     #printable {
@@ -474,66 +555,204 @@ body {
     </style>
 </head>
 <body>
-    <div class="nav">
-        <a href="/${id}/plain">Plain</a>
-        <a href="/${id}/base64">Base64</a>
-        <a href="/${id}/md5">MD5</a>
-        <a href="/${id}/mtime">Mtime</a>
-        <a href="/${id}/html">Type:HTML</a>
-        <a href="/${id}/css">Type:CSS</a>
-        <a href="/${id}/js">Type:JS</a>
-    </div>
-    <div class="container">
-        <textarea id="content">${escapeHtml(text)}</textarea>
-    </div>
+    <script id="note-meta" type="application/json">${JSON.stringify(meta).replace(/</g, '\\u003c')}</script>
+    <header class="toolbar">
+        <button type="button" class="icon" id="new-note" title="New note" aria-label="New note">🗋</button>
+        <button type="button" class="icon" id="save-note" title="Save" aria-label="Save" disabled>💾</button>
+        <span class="grow"></span>
+        <select id="output-mode" aria-label="Output format">
+            <option value="" selected disabled>Output&hellip;</option>
+            <option value=".txt">Plain text</option>
+            <option value=".base64">Base64</option>
+        </select>
+    </header>
+    <main>
+        <textarea id="content" autocomplete="off" autocapitalize="off">${escapeHtml(text)}</textarea>
+    </main>
+    <footer class="statusbar">
+        <span id="saved-at">Not saved yet</span>
+        <span class="grow"></span>
+        <label for="expiry">Expires
+            <select id="expiry" aria-label="Expiry">
+                <option value="24h">24 hours</option>
+                <option value="72h">72 hours</option>
+                <option value="1w">1 week</option>
+                <option value="never">Never</option>
+            </select>
+        </label>
+    </footer>
     <pre id="printable"></pre>
     <script>
 /*! Minimalist Web Notepad | https://github.com/pereorga/minimalist-web-notepad */
+(function () {
+    'use strict';
 
-function uploadContent() {
+    var AUTOSAVE_MS = 60000;
+    var DAY_MS = 24 * 60 * 60 * 1000;
+    var NOTE_ID = ${JSON.stringify(id)};
 
-    // If textarea value changes.
-    if (content !== textarea.value) {
-        var temp = textarea.value;
+    var textarea = document.getElementById('content');
+    var printable = document.getElementById('printable');
+    var outputMode = document.getElementById('output-mode');
+    var expiry = document.getElementById('expiry');
+    var savedAtEl = document.getElementById('saved-at');
+    var saveButton = document.getElementById('save-note');
+
+    var meta;
+    try {
+        meta = JSON.parse(document.getElementById('note-meta').textContent || '{}') || {};
+    } catch (err) {
+        meta = {};
+    }
+
+    var content = textarea.value;
+    var saving = false;
+    var dirty = false;
+
+    // Make the content available to print.
+    printable.appendChild(document.createTextNode(content));
+
+    function pad(n) {
+        return String(n).padStart(2, '0');
+    }
+
+    function showSavedAt(ms) {
+        if (ms == null) {
+            savedAtEl.textContent = 'Not saved yet';
+            return;
+        }
+        var d = new Date(ms);
+        savedAtEl.textContent = 'Saved ' + d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+            ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+    }
+
+    function pickExpiry() {
+        // A brand-new note (no created_at yet) starts on the 24-hour default.
+        if (meta.createdAt == null) {
+            expiry.value = '24h';
+            return;
+        }
+        if (meta.expiresAt == null) {
+            expiry.value = 'never';
+            return;
+        }
+        var span = meta.expiresAt - (meta.updatedAt != null ? meta.updatedAt : meta.expiresAt);
+        if (span === DAY_MS) expiry.value = '24h';
+        else if (span === 3 * DAY_MS) expiry.value = '72h';
+        else if (span === 7 * DAY_MS) expiry.value = '1w';
+        else expiry.value = '24h';
+    }
+
+    function updateSaveState() {
+        saveButton.disabled = textarea.value === content;
+    }
+
+    function send(body, onDone) {
         var request = new XMLHttpRequest();
-
         request.open('POST', window.location.href, true);
         request.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
-        request.onload = function() {
-            if (request.readyState === 4) {
-
-                // Request has ended, check again after 1 second.
-                content = temp;
-                setTimeout(uploadContent, 1000);
+        request.onload = function () {
+            if (request.readyState === 4 && request.status >= 200 && request.status < 300) {
+                try {
+                    var data = JSON.parse(request.responseText);
+                    if (data && data.updated_at != null) {
+                        meta.createdAt = data.created_at;
+                        meta.updatedAt = data.updated_at;
+                        meta.expiresAt = data.expires_at;
+                        showSavedAt(data.updated_at);
+                    }
+                } catch (err) {
+                    // Non-JSON responses (for example a delete) are expected.
+                }
             }
-        }
-        request.onerror = function() {
+            if (onDone) onDone();
+        };
+        request.onerror = function () {
+            if (onDone) onDone();
+        };
+        request.send(body);
+    }
 
-            // Try again after 1 second.
-            setTimeout(uploadContent, 1000);
+    function payload(value) {
+        return 'text=' + encodeURIComponent(value) + '&expires=' + encodeURIComponent(expiry.value);
+    }
+
+    function save(force) {
+        var temp = textarea.value;
+
+        if (!force && temp === content) return;
+        if (!force && temp.length === 0 && meta.createdAt == null) return;
+        if (saving) {
+            dirty = true;
+            return;
         }
-        request.send('text=' + encodeURIComponent(temp));
+
+        saving = true;
 
         // Make the content available to print.
         printable.removeChild(printable.firstChild);
         printable.appendChild(document.createTextNode(temp));
+
+        send(payload(temp), function () {
+            saving = false;
+            content = temp;
+            updateSaveState();
+            if (dirty) {
+                dirty = false;
+                save(true);
+            }
+        });
     }
-    else {
 
-        // Content has not changed, check again after 1 second.
-        setTimeout(uploadContent, 1000);
+    function autosave() {
+        save(false);
+        setTimeout(autosave, AUTOSAVE_MS);
     }
-}
 
-var textarea = document.getElementById('content');
-var printable = document.getElementById('printable');
-var content = textarea.value;
+    saveButton.addEventListener('click', function () {
+        save(true);
+    });
 
-// Make the content available to print.
-printable.appendChild(document.createTextNode(content));
+    textarea.addEventListener('input', updateSaveState);
 
-textarea.focus();
-uploadContent();
+    document.getElementById('new-note').addEventListener('click', function () {
+        var input = window.prompt('Note ID', '');
+        if (input === null) return;
+
+        // Keep only characters a note id accepts.
+        var id = input.replace(/[^a-zA-Z0-9_-]/g, '');
+        if (id.length === 0) {
+            window.alert('Enter a valid note ID: letters, digits, "-" and "_".');
+            return;
+        }
+
+        var go = function () {
+            window.location.href = '/' + id;
+        };
+        var temp = textarea.value;
+        if (temp.length === 0) {
+            go();
+            return;
+        }
+        send(payload(temp), go);
+    });
+
+    expiry.addEventListener('change', function () {
+        save(true);
+    });
+
+    outputMode.addEventListener('change', function () {
+        if (outputMode.value) {
+            window.location.href = '/' + NOTE_ID + outputMode.value;
+        }
+    });
+
+    showSavedAt(meta.updatedAt);
+    pickExpiry();
+    updateSaveState();
+    textarea.focus();
+    autosave();
+})();
     </script>
 </body>
 </html>`;
@@ -552,7 +771,21 @@ export default {
       return redirect('/' + randomNoteId());
     }
 
-    const id = segments[0];
+    // Output is addressed by file suffix: /<id>.txt and /<id>.base64.
+    // Any other suffix is an illegal file request.
+    const filename = segments[0];
+    let id = filename;
+    let suffixMode = '';
+    const dot = filename.lastIndexOf('.');
+    if (dot !== -1) {
+      const ext = filename.slice(dot + 1);
+      id = filename.slice(0, dot);
+      if (ext === 'txt') suffixMode = 'plain';
+      else if (ext === 'base64') suffixMode = 'base64';
+      else return badRequest();
+      if (!NOTE_ID_RE.test(id)) return badRequest();
+    }
+
     const pathMode = segments[1] ?? '';
     if (
       segments.length > 2 ||
@@ -562,7 +795,7 @@ export default {
       return notFound();
     }
 
-    const mode = pathMode || url.searchParams.get('mode') || '';
+    const mode = suffixMode || pathMode || url.searchParams.get('mode') || '';
 
     if (request.method === 'POST') return handlePost(request, env, id, mode);
     if (request.method !== 'GET' && request.method !== 'HEAD') return notFound();

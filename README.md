@@ -2,15 +2,16 @@
 
 A port of the single-file PHP app in the repository root (`index.php`) to a
 [Cloudflare Worker](https://developers.cloudflare.com/workers/) backed by
-[D1](https://developers.cloudflare.com/d1/). Same URLs, same output modes,
-same 1-second autosave UI — but serverless and durable.
+[D1](https://developers.cloudflare.com/d1/). Same URLs and output modes, now
+with a 60-second autosave UI and a per-note expiry control — but serverless and
+durable.
 
 ## What changed vs. the PHP version
 
 | Concern | PHP app | Worker app |
 | --- | --- | --- |
 | Storage | flat files in `_tmp/` | D1 table `notes` |
-| Body storage | raw bytes on disk | **zstd-compressed BLOB** |
+| Body storage | raw bytes on disk | **zstd BLOB; plain UTF-8 when < 128 bytes** |
 | Expiry / GC | none | `expires_at` column + daily Cron Trigger |
 | Password | none | reserved `password_*` columns (not enforced yet) |
 | Routing | `.htaccess` rewrite | Worker `fetch` handler |
@@ -29,11 +30,18 @@ worker/
 ## Behaviour (identical to the PHP app)
 
 - `GET /` → `302` to a random 5-char note id (`234579abcdefghjkmnpqrstwxyz`).
-- `GET /:note` → HTML editor; autosaves via `POST` every 1s.
-- `GET /:note/:mode` → stored note in that mode:
-  `plain`, `base64`, `md5`, `mtime`, `html`, `css`, `js`, `json`.
-  Unknown modes and `mtime` fall back / report as before.
-- `POST /:note` with a `text` form field → save (empty `text` **deletes**).
+- `GET /:note` → HTML editor; autosaves via `POST` every 60s. The toolbar has
+  New / Save buttons and an output `<select>`; the status bar shows the last
+  saved time and a per-note expiry `<select>`.
+- `GET /:note.txt` → stored note as plain text.
+- `GET /:note.base64` → stored note as base64.
+- Any other file suffix (e.g. `/index.jsp`, `/note.html`) → `400`.
+- `GET /:note/:mode` → legacy mode route, still accepted:
+  `plain`, `base64`, `mtime`, `html`, `css`, `js`, `json`. Unknown modes fall
+  back to raw text.
+- `POST /:note` with a `text` form field → save (empty `text` **deletes**);
+  responds with JSON `{ created_at, updated_at, expires_at }`. An optional
+  `expires` field (`24h`, `72h`, `1w`, `never`) sets the note's expiry.
 - `POST /:note` with a raw body → CLI save.
 - `POST /:note/append` with a raw body → CLI append.
 - Any `curl` user-agent → raw stored body, no HTML wrapper.
@@ -41,11 +49,12 @@ worker/
 
 ## Compression
 
-Every note body is zstd-compressed via `node:zlib` and stored as a BLOB.
-`content_encoding` records the codec (`zstd`), and `size_raw` / `size_stored`
-record both sizes for visibility. Reads transparently decompress; `gzip` and
-`identity` are also understood so data written by an earlier build stays
-readable.
+Note bodies shorter than 128 bytes are stored as plain UTF-8
+(`content_encoding = 'identity'`); larger bodies are zstd-compressed via
+`node:zlib` and stored as a BLOB (`content_encoding = 'zstd'`). `size_raw` /
+`size_stored` record both sizes for visibility. Reads transparently decode;
+`gzip` and `identity` are also understood so data written by an earlier build
+stays readable.
 
 Why `node:zlib` instead of the Web `CompressionStream` API? The Web API only
 implements `gzip` / `deflate` / `deflate-raw` in Workers — `zstd` (and
@@ -54,7 +63,9 @@ the `nodejs_compat` compatibility flag already set in `wrangler.toml`.
 
 ## Expiry and garbage collection
 
-- On every write, `expires_at = now + NOTE_TTL_DAYS` (default `30`, set
+- The web editor sends an `expires` token (`24h`, `72h`, `1w`, `never`); the
+  Worker sets `expires_at = now + token` accordingly. Writes without a token
+  (CLI) fall back to `expires_at = now + NOTE_TTL_DAYS` (default `30`, set
   `NOTE_TTL_DAYS = "0"` to disable). `created_at` is set once, `updated_at`
   on every write.
 - A Cron Trigger (`0 3 * * *`) runs the `scheduled` handler, which deletes
@@ -94,7 +105,6 @@ Manual smoke test (mirrors the PHP checklist):
 curl -s https://<your-worker>/cli-test/plain          # empty
 echo hello | curl --data-binary @- https://<your-worker>/cli-test
 curl https://<your-worker>/cli-test                    # hello (curl UA → raw)
-curl https://<your-worker>/cli-test/md5                # 5d41402a...
 echo " world" | curl --data-binary @- https://<your-worker>/cli-test/append
 curl https://<your-worker>/cli-test                    # hello world
 ```
