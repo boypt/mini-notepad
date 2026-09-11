@@ -1,5 +1,5 @@
 /**
- * Minimalist Web Notepad — Cloudflare Workers Mod
+ * Web Notepad — Cloudflare Workers Mod
  *
  * A module Worker backed by D1.
  *
@@ -59,7 +59,7 @@ const EXPIRY_TOKENS = {
 /** User agents allowed to use the raw command-line write path. */
 const CLI_USER_AGENTS = ['curl', 'wget'];
 /** Fallback CSRF secret for local/dev; set CSRF_SECRET in production. */
-const DEFAULT_CSRF_SECRET = 'minimalist-notepad-dev-secret';
+const DEFAULT_CSRF_SECRET = 'web-notepad-dev-secret';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -443,11 +443,11 @@ export function renderPage(id, text, meta = {}) {
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="generator" content="Minimalist Web Notepad Workers Mod">
+    <meta name="generator" content="Web Notepad Workers Mod">
     <title>${escapeHtml(id)}</title>
     <link rel="shortcut icon" href="/favicon.ico">
     <style>
-/*! Minimalist Web Notepad Workers Mod */
+/*! Web Notepad Workers Mod */
 
 *, *::before, *::after {
     box-sizing: border-box;
@@ -693,7 +693,7 @@ main {
     </footer>
     <pre id="printable"></pre>
     <script>
-/*! Minimalist Web Notepad Workers Mod */
+/*! Web Notepad Workers Mod */
 (function () {
     'use strict';
 

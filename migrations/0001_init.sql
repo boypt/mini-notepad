@@ -1,4 +1,4 @@
--- Minimalist Web Notepad — initial D1 schema.
+-- Web Notepad — initial D1 schema.
 --
 -- Note bodies are zstd-compressed and stored as a BLOB in `content`.
 -- `content_encoding` records the codec so the format can evolve without a

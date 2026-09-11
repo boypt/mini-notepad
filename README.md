@@ -1,4 +1,4 @@
-# Minimalist Web Notepad (Cloudflare Workers + D1)
+# Web Notepad (Cloudflare Workers + D1)
 
 A small web notepad. It runs on [Cloudflare Workers](https://developers.cloudflare.com/workers/).
 It stores notes in a [D1](https://developers.cloudflare.com/d1/) database.
@@ -144,10 +144,10 @@ See [DEPLOY.md](./DEPLOY.md) for the full production steps.
 npm install
 
 # 1. Create the D1 database. Copy the printed database_id into wrangler.toml.
-npx wrangler d1 create minimalist-web-notepad
+npx wrangler d1 create web-notepad
 
 # 2. Apply the schema. Use --local for local dev.
-npx wrangler d1 migrations apply minimalist-web-notepad --remote
+npx wrangler d1 migrations apply web-notepad --remote
 
 # 3. Run local, or deploy.
 npx wrangler dev

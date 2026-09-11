@@ -69,7 +69,7 @@ For CI or a computer without a browser, use an API token. See section 8.
 ## 4. Create the D1 database
 
 ```sh
-npx wrangler d1 create minimalist-web-notepad
+npx wrangler d1 create web-notepad
 ```
 
 The command prints the database details. Example:
@@ -77,7 +77,7 @@ The command prints the database details. Example:
 ```
 [[d1_databases]]
 binding = "DB"
-database_name = "minimalist-web-notepad"
+database_name = "web-notepad"
 database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ```
 
@@ -101,7 +101,7 @@ Optional flags:
 
 ```sh
 # 1. Apply the schema to the local database.
-npx wrangler d1 migrations apply minimalist-web-notepad --local
+npx wrangler d1 migrations apply web-notepad --local
 
 # 2. Start the local dev server (default http://127.0.0.1:8787).
 npm run dev
@@ -130,7 +130,7 @@ curl http://127.0.0.1:8787/cli-test            # hello world
 Look at the local database:
 
 ```sh
-npx wrangler d1 execute minimalist-web-notepad --local \
+npx wrangler d1 execute web-notepad --local \
   --command "SELECT id, content_encoding, size_raw, size_stored, expires_at FROM notes"
 ```
 
@@ -143,7 +143,7 @@ Local state is in `.wrangler/`. `.gitignore` ignores it.
 Apply the schema to the cloud database **before** you deploy the code:
 
 ```sh
-npx wrangler d1 migrations apply minimalist-web-notepad --remote
+npx wrangler d1 migrations apply web-notepad --remote
 ```
 
 - Migration files are in `migrations/`. They run in file-name order. Applied
@@ -166,7 +166,7 @@ npm run deploy        # same as: npx wrangler deploy
 
 After the deploy, Wrangler prints the Worker URL:
 
-- Default: `https://minimalist-web-notepad.<your-subdomain>.workers.dev`
+- Default: `https://web-notepad.<your-subdomain>.workers.dev`
 - Run the smoke test in section 9 right after the deploy.
 
 The deploy includes:
@@ -196,7 +196,7 @@ Set these environment variables, then deploy from a pipeline:
 
 ```sh
 npm ci
-npx wrangler d1 migrations apply minimalist-web-notepad --remote
+npx wrangler d1 migrations apply web-notepad --remote
 npx wrangler deploy
 ```
 
@@ -242,7 +242,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "$BASE/smoke/plain"     # 302 -> /smoke
 curl -s -o /dev/null -w '%{http_code}\n' "$BASE/favicon.ico"     # 200
 
 # 6. Check the stored encoding and expiry.
-npx wrangler d1 execute minimalist-web-notepad --remote \
+npx wrangler d1 execute web-notepad --remote \
   --command "SELECT id, content_encoding, size_raw, size_stored, expires_at FROM notes LIMIT 5"
 ```
 
@@ -288,7 +288,7 @@ want a fixed expiry from the creation time, change the migration or the
 
 ## 11. Custom domain / routes
 
-In the dashboard: Workers & Pages → choose `minimalist-web-notepad` →
+In the dashboard: Workers & Pages → choose `web-notepad` →
 Settings → Domains & Routes → add a custom domain. You can also set it in
 `wrangler.toml`:
 
@@ -331,7 +331,7 @@ You did not replace `REPLACE_WITH_YOUR_DATABASE_ID` in `wrangler.toml`. Run
 
 **It works locally but the cloud says "no such table: notes"**
 The cloud database has no schema yet. Run
-`npx wrangler d1 migrations apply minimalist-web-notepad --remote`.
+`npx wrangler d1 migrations apply web-notepad --remote`.
 
 **`zstdCompressSync is not a function`**
 The `nodejs_compat` flag is missing, or `compatibility_date` is too old. Check

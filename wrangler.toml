@@ -1,5 +1,5 @@
 #:schema node_modules/wrangler/config-schema.json
-name = "minimalist-web-notepad"
+name = "web-notepad"
 main = "src/index.js"
 compatibility_date = "2026-06-12"
 # zstd compression is provided by node:zlib, which needs the compat flag.
@@ -11,10 +11,10 @@ compatibility_flags = ["nodejs_compat"]
 directory = "./public"
 
 # D1 binding. Create the database first, then paste its id here:
-#   npx wrangler d1 create minimalist-web-notepad
+#   npx wrangler d1 create web-notepad
 [[d1_databases]]
 binding = "DB"
-database_name = "minimalist-web-notepad"
+database_name = "web-notepad"
 database_id = "REPLACE_WITH_YOUR_DATABASE_ID"
 migrations_dir = "migrations"
 
