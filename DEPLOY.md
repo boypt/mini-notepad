@@ -154,7 +154,7 @@ npx wrangler d1 migrations apply minimalist-web-notepad --remote
 
 > Code and data stay compatible. The reader knows `zstd`, `gzip`, and
 > `identity`. So you can add fields or change the default codec without
-> backfilling old rows.
+> backfilling existing rows.
 
 ---
 
@@ -367,8 +367,8 @@ requests that do not match a file go to the Worker.
 
 - Every response has `Cache-Control: no-store` and
   `X-Robots-Tag: noindex, nofollow`.
-- The original PHP app used Apache Basic Auth. That does not work on Workers.
-  For access control, use Cloudflare Access or add auth code to the Worker.
+- Workers do not provide built-in HTTP Basic Auth. For access control, use
+  Cloudflare Access or add auth code to the Worker.
 - Password view is not enabled yet. The table has the `password_*` columns. A
   future version should hash with PBKDF2 (`crypto.subtle`) and use
   `is_protected` to control reads.

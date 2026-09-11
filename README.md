@@ -21,7 +21,6 @@ It stores notes in a [D1](https://developers.cloudflare.com/d1/) database.
 | `GET /:note` | Shows the HTML editor. |
 | `GET /:note.txt` | Shows the note as plain text. |
 | `GET /:note.base64` | Shows the note as Base64. |
-| `GET /:note/:mode` | Old route. It still works. |
 | `POST /:note` (form field `text`) | Saves the note. An empty `text` deletes it. |
 | `POST /:note` (raw body) | CLI save. |
 | `POST /:note/append` (raw body) | CLI append. |
@@ -40,9 +39,6 @@ The output menu opens a file name:
 - `/<id>.txt` gives plain text.
 - `/<id>.base64` gives Base64.
 
-The old `/<id>/<mode>` route still works. It supports `plain`, `base64`,
-`mtime`, `html`, `css`, `js`, and `json`. An unknown mode gives raw text.
-
 ## Storage and compression
 
 - A note shorter than 128 bytes is saved as plain UTF-8 text.
@@ -50,8 +46,7 @@ The old `/<id>/<mode>` route still works. It supports `plain`, `base64`,
 - A longer note is compressed with zstd and saved as a BLOB.
   `content_encoding` is `zstd`.
 - The table stores `size_raw` and `size_stored`.
-- On read, the code can decode `zstd`, `gzip`, and `identity`. So old notes
-  still work.
+- On read, the code can decode `zstd`, `gzip`, and `identity`.
 
 Why `node:zlib`? In Workers, the Web `CompressionStream` API supports only
 `gzip`, `deflate`, and `deflate-raw`. It does not support zstd or brotli.
@@ -129,8 +124,3 @@ curl "$BASE/cli-test.base64"     # aGVsbG8=
 echo " world" | curl --data-binary @- "$BASE/cli-test/append"
 curl "$BASE/cli-test"            # hello world
 ```
-
-## Note
-
-This repository holds the Worker version of the app. It is a port of the
-original single-file PHP notepad.

@@ -1,10 +1,9 @@
 /**
- * Minimalist Web Notepad — Cloudflare Workers edition
+ * Minimalist Web Notepad — Cloudflare Workers Mod
  *
- * Port of the single-file PHP app in ../index.php (fork of
- * pereorga/minimalist-web-notepad) to a module Worker backed by D1.
+ * A module Worker backed by D1.
  *
- * Behavioural parity with the PHP version is intentional:
+ * Routes:
  *   - GET  /                     -> 302 redirect to a random 5-char note id
  *   - GET  /:note                -> HTML editor
  *   - GET  /:note.txt            -> stored note as plain text
@@ -18,7 +17,7 @@
  *   - POST /:note/append         -> CLI append
  *   - curl user-agent            -> raw body, no HTML wrapper
  *
- * Differences from the PHP version:
+ * Storage:
  *   - Bodies are zstd-compressed (node:zlib) before they are written to D1;
  *     bodies shorter than 128 bytes are stored as plain UTF-8 instead
  *     (content_encoding = 'identity').
@@ -59,7 +58,7 @@ const decoder = new TextDecoder();
 // Shared response helpers
 // ---------------------------------------------------------------------------
 
-/** Cache headers shared by every response (mirrors the PHP version). */
+/** Cache headers shared by every response. */
 function noStore(extra) {
   return {
     'Cache-Control': 'no-cache, no-store, must-revalidate',
@@ -106,7 +105,7 @@ function badRequest() {
 // Encoding / compression
 // ---------------------------------------------------------------------------
 
-/** Random note id from the unambiguous alphabet (same set as the PHP app). */
+/** Random note id from an unambiguous alphabet. */
 export function randomNoteId(length = 5) {
   const bytes = new Uint8Array(length);
   crypto.getRandomValues(bytes);
@@ -383,11 +382,11 @@ export function renderPage(id, text, meta = {}) {
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="generator" content="Minimalist Web Notepad Developers Mod (Workers)">
+    <meta name="generator" content="Minimalist Web Notepad Workers Mod">
     <title>${escapeHtml(id)}</title>
     <link rel="shortcut icon" href="/favicon.ico">
     <style>
-/*! Minimalist Web Notepad | https://github.com/pereorga/minimalist-web-notepad */
+/*! Minimalist Web Notepad Workers Mod */
 
 *, *::before, *::after {
     box-sizing: border-box;
@@ -583,7 +582,7 @@ main {
     </footer>
     <pre id="printable"></pre>
     <script>
-/*! Minimalist Web Notepad | https://github.com/pereorga/minimalist-web-notepad */
+/*! Minimalist Web Notepad Workers Mod */
 (function () {
     'use strict';
 
