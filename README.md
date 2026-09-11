@@ -56,6 +56,18 @@ Save a note with a raw body:
 echo "hello" | curl --data-binary @- https://<your-worker>/my-note
 ```
 
+The save prints a receipt with the time and the read URLs:
+
+```text
+Saved.
+Note:    my-note
+Saved:   2026-01-31 12:00:00 UTC
+Expires: 2026-03-02 12:00:00 UTC
+Plain:   https://<your-worker>/my-note.txt
+Base64:  https://<your-worker>/my-note.base64
+Editor:  https://<your-worker>/my-note
+```
+
 Read it back:
 
 ```sh

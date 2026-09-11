@@ -83,11 +83,17 @@ function redirect(location) {
   return new Response(null, { status: 302, headers: noStore({ Location: location }) });
 }
 
-function emptyOk() {
-  return new Response('', {
+function textOk(body) {
+  return new Response(body, {
     status: 200,
     headers: noStore({ 'Content-Type': 'text/plain; charset=utf-8' }),
   });
+}
+
+/** Format epoch milliseconds as "YYYY-MM-DD HH:MM:SS UTC"; null means never. */
+function formatUtc(ms) {
+  if (ms == null) return 'never';
+  return new Date(ms).toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
 }
 
 function jsonOk(value) {
@@ -293,6 +299,8 @@ async function saveNote(env, id, text, { append = false, expires } = {}) {
        updated_at       = excluded.updated_at,
        expires_at       = excluded.expires_at`,
   ).bind(id, bytes, encoding, rawSize, bytes.byteLength, now, now, expiresAt).run();
+
+  return { updatedAt: now, expiresAt };
 }
 
 /** Delete every row whose expiry has passed (used by the Cron Trigger). */
@@ -334,11 +342,33 @@ function verifyCsrf(env, id, token) {
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
+/**
+ * Friendly plain-text receipt for a command-line write (curl/wget): confirms
+ * the save, prints the save time, and lists the read URLs.
+ */
+function cliReceipt(url, id, verb, updatedAt, expiresAt) {
+  return textOk([
+    `${verb}.`,
+    `Note:    ${id}`,
+    `Saved:   ${formatUtc(updatedAt)}`,
+    `Expires: ${formatUtc(expiresAt)}`,
+    `Plain:   ${url.origin}/${id}.txt`,
+    `Base64:  ${url.origin}/${id}.base64`,
+    `Editor:  ${url.origin}/${id}`,
+    '',
+  ].join('\n'));
+}
+
+function cliDeleted(id) {
+  return textOk(`Deleted.\nNote:    ${id}\n`);
+}
+
 async function handlePost(request, env, id, mode) {
   const contentType = request.headers.get('content-type') || '';
   const userAgent = request.headers.get('user-agent') || '';
   const cli = isCliUserAgent(userAgent);
   const raw = await request.text();
+  const url = new URL(request.url);
 
   // Web (form) save path: the autosave XHR posts `text=...` (and `expires=...`).
   // A browser must send the per-note CSRF token from the page. Whitelisted CLI
@@ -350,10 +380,11 @@ async function handlePost(request, env, id, mode) {
       const text = params.get('text') ?? '';
       if (text.length === 0) {
         await deleteNote(env, id);
-        return jsonOk({ deleted: true });
+        return cli ? cliDeleted(id) : jsonOk({ deleted: true });
       }
       const expires = resolveExpiryToken(params.get('expires'));
-      await saveNote(env, id, text, { expires });
+      const saved = await saveNote(env, id, text, { expires });
+      if (cli) return cliReceipt(url, id, 'Saved', saved.updatedAt, saved.expiresAt);
       const row = await env.DB.prepare(
         'SELECT created_at, updated_at, expires_at FROM notes WHERE id = ? LIMIT 1',
       ).bind(id).first();
@@ -367,9 +398,11 @@ async function handlePost(request, env, id, mode) {
 
   // CLI path: raw request body. Only whitelisted CLI user agents may use it.
   if (!cli) return forbidden();
-  if (mode === 'append') await saveNote(env, id, raw, { append: true });
-  else await saveNote(env, id, raw);
-  return emptyOk();
+  const append = mode === 'append';
+  const saved = append
+    ? await saveNote(env, id, raw, { append: true })
+    : await saveNote(env, id, raw);
+  return cliReceipt(url, id, append ? 'Appended' : 'Saved', saved.updatedAt, saved.expiresAt);
 }
 
 function modeResponse(loaded, mode) {
