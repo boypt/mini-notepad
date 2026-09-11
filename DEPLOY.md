@@ -200,7 +200,13 @@ npx wrangler d1 migrations apply minimalist-web-notepad --remote
 npx wrangler deploy
 ```
 
-If you need a secret later (for example, for passwords), use:
+Set a secret for the CSRF token (recommended):
+
+```sh
+npx wrangler secret put CSRF_SECRET
+```
+
+If you need another secret later (for example, for passwords), use:
 
 ```sh
 npx wrangler secret put SOME_SECRET
@@ -367,6 +373,12 @@ requests that do not match a file go to the Worker.
 
 - Every response has `Cache-Control: no-store` and
   `X-Robots-Tag: noindex, nofollow`.
+- A browser form save needs a per-note CSRF token. The page embeds the token.
+  A blind POST returns `403`. This stops crawlers from creating notes.
+- A raw CLI write is allowed only for whitelisted user agents: `curl` and
+  `wget`. Set a strong token secret with
+  `npx wrangler secret put CSRF_SECRET`. Without it, the Worker uses a
+  built-in default.
 - Workers do not provide built-in HTTP Basic Auth. For access control, use
   Cloudflare Access or add auth code to the Worker.
 - Password view is not enabled yet. The table has the `password_*` columns. A

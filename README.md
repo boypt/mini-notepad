@@ -27,7 +27,10 @@ Notes:
 
 - A note ID uses only these characters: `a-z`, `A-Z`, `0-9`, `_`, and `-`.
 - A file suffix we do not know (for example `/index.jsp`) returns `400`.
-- A `curl` user agent gets the raw note body. It does not get HTML.
+- A browser form save must include the per-note CSRF token from the page. A
+  blind POST returns `403`.
+- `curl` and `wget` user agents may save without a token. On GET they get the
+  raw note body, not HTML.
 - All responses use `no-store` and `X-Robots-Tag: noindex, nofollow`.
 
 ## Output modes
@@ -67,6 +70,17 @@ curl https://<your-worker>/my-note.base64
 ```
 
 A `curl` user agent gets the raw note text, not the HTML page.
+
+## Security
+
+- A browser form save needs the per-note CSRF token. The page embeds it.
+- A raw CLI write is allowed only for whitelisted user agents: `curl` and
+  `wget`.
+- In production, set a secret for the CSRF token:
+  ```sh
+  npx wrangler secret put CSRF_SECRET
+  ```
+  If you do not set it, the Worker uses a built-in default.
 
 ## Storage and compression
 

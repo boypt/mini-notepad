@@ -15,7 +15,11 @@
  *   - POST /:note  (form `text`) -> save; empty `text` deletes
  *   - POST /:note  (raw body)    -> CLI save
  *   - POST /:note/append         -> CLI append
- *   - curl user-agent            -> raw body, no HTML wrapper
+ *   - CLI user-agent             -> raw body, no HTML wrapper
+ *
+ * Security:
+ *   - A browser form save must carry the per-note CSRF token from the page.
+ *   - A raw CLI write is allowed only for whitelisted user agents (curl, wget).
  *
  * Storage:
  *   - Bodies are zstd-compressed (node:zlib) before they are written to D1;
@@ -34,6 +38,8 @@
  */
 
 import zlib from 'node:zlib';
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import { Buffer } from 'node:buffer';
 
 const NOTE_ID_RE = /^[a-zA-Z0-9_-]+$/;
 const MODE_RE = /^[a-z0-9]*$/;
@@ -50,6 +56,10 @@ const EXPIRY_TOKENS = {
   '72h': 3 * DAY_MS,
   '1w': 7 * DAY_MS,
 };
+/** User agents allowed to use the raw command-line write path. */
+const CLI_USER_AGENTS = ['curl', 'wget'];
+/** Fallback CSRF secret for local/dev; set CSRF_SECRET in production. */
+const DEFAULT_CSRF_SECRET = 'minimalist-notepad-dev-secret';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -97,6 +107,13 @@ function notFound() {
 function badRequest() {
   return new Response('Bad request', {
     status: 400,
+    headers: noStore({ 'Content-Type': 'text/plain; charset=utf-8' }),
+  });
+}
+
+function forbidden() {
+  return new Response('Forbidden', {
+    status: 403,
     headers: noStore({ 'Content-Type': 'text/plain; charset=utf-8' }),
   });
 }
@@ -277,17 +294,50 @@ async function gcExpired(env) {
 }
 
 // ---------------------------------------------------------------------------
+// Request security
+// ---------------------------------------------------------------------------
+
+/** True for user agents we allow to use the raw command-line write path. */
+function isCliUserAgent(userAgent) {
+  const ua = (userAgent || '').trim().toLowerCase();
+  return CLI_USER_AGENTS.some((name) => ua.startsWith(name));
+}
+
+/** Per-note CSRF token: HMAC-SHA256 of the note id. */
+function csrfToken(env, id) {
+  const secret = env.CSRF_SECRET || DEFAULT_CSRF_SECRET;
+  return createHmac('sha256', secret).update(id).digest('hex');
+}
+
+/** Constant-time check of a form CSRF token against the expected value. */
+function verifyCsrf(env, id, token) {
+  if (typeof token !== 'string') return false;
+  const expected = csrfToken(env, id);
+  if (token.length !== expected.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(token, 'utf8'), Buffer.from(expected, 'utf8'));
+  } catch (err) {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
 async function handlePost(request, env, id, mode) {
   const contentType = request.headers.get('content-type') || '';
+  const userAgent = request.headers.get('user-agent') || '';
+  const cli = isCliUserAgent(userAgent);
   const raw = await request.text();
 
   // Web (form) save path: the autosave XHR posts `text=...` (and `expires=...`).
+  // A browser must send the per-note CSRF token from the page. Whitelisted CLI
+  // tools may skip it so `curl -d 'text=...'` keeps working.
   if (contentType.includes('application/x-www-form-urlencoded')) {
     const params = new URLSearchParams(raw);
     if (params.has('text')) {
+      if (!cli && !verifyCsrf(env, id, params.get('csrf'))) return forbidden();
       const text = params.get('text') ?? '';
       if (text.length === 0) {
         await deleteNote(env, id);
@@ -306,7 +356,8 @@ async function handlePost(request, env, id, mode) {
     }
   }
 
-  // CLI path: raw request body. `mode=append` appends instead of overwriting.
+  // CLI path: raw request body. Only whitelisted CLI user agents may use it.
+  if (!cli) return forbidden();
   if (mode === 'append') await saveNote(env, id, raw, { append: true });
   else await saveNote(env, id, raw);
   return emptyOk();
@@ -352,7 +403,7 @@ async function handleGet(request, env, ctx, id, mode) {
   }
 
   const userAgent = request.headers.get('user-agent') || '';
-  if (userAgent.startsWith('curl')) {
+  if (isCliUserAgent(userAgent)) {
     return new Response(loaded ? loaded.text : '', {
       status: 200,
       headers: noStore({ 'Content-Type': 'text/plain; charset=utf-8' }),
@@ -366,6 +417,7 @@ async function handleGet(request, env, ctx, id, mode) {
         expiresAt: loaded.row.expires_at ?? null,
       }
     : { createdAt: null, updatedAt: null, expiresAt: null };
+  meta.csrf = csrfToken(env, id);
   return new Response(renderPage(id, loaded ? loaded.text : '', meta), {
     status: 200,
     headers: noStore({ 'Content-Type': 'text/html; charset=utf-8' }),
@@ -676,7 +728,9 @@ main {
     }
 
     function payload(value) {
-        return 'text=' + encodeURIComponent(value) + '&expires=' + encodeURIComponent(expiry.value);
+        return 'text=' + encodeURIComponent(value) +
+            '&expires=' + encodeURIComponent(expiry.value) +
+            '&csrf=' + encodeURIComponent(meta.csrf || '');
     }
 
     function save(force) {
