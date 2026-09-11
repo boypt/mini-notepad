@@ -1,7 +1,14 @@
 # Web Notepad (Cloudflare Workers + D1)
 
-A small web notepad. It runs on [Cloudflare Workers](https://developers.cloudflare.com/workers/).
-It stores notes in a [D1](https://developers.cloudflare.com/d1/) database.
+A Pastebin-like notebook. It runs on
+[Cloudflare Workers](https://developers.cloudflare.com/workers/) and stores
+every note in a [D1](https://developers.cloudflare.com/d1/) database.
+
+The main job is simple:
+
+- **Paste** code or text in the browser.
+- **Share** it with a short link.
+- **Use** it again as `.txt` or `.base64`, or from the command line.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/boypt/mini-notepad)
 
@@ -11,11 +18,14 @@ apply the database schema once (see [Setup](#setup)).
 
 ## Features
 
-- Simple text editing in the browser.
-- Output as plain text or Base64.
-- Command-line read, write, and append (see
-  [Command line](#command-line)).
-- Made for IT maintenance and programmers who need to share text quickly.
+- Paste code or plain text in the browser. No login, no setup.
+- Share a note with a short link. A note ID is 5 random characters.
+- Read a note as plain text (`/<id>.txt`) or Base64 (`/<id>.base64`).
+- Read, write, and append from the command line (`curl`, `wget`). See
+  [Command line](#command-line).
+- Auto-save, line numbers, font size, copy/paste buttons, and an expiry choice.
+- Made for IT maintenance and programmers who need to share code or text
+  quickly.
 
 ## Routes
 
