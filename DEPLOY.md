@@ -113,6 +113,17 @@ Local checks:
 # The root path should redirect (302) to a random 5-character ID.
 curl -s -D - -o /dev/null http://127.0.0.1:8787/
 
+# CLI write to the root. The Worker makes a random ID and prints it in the
+# receipt. The output looks like:
+#   Saved.
+#   Note:    7k2ma
+#   Saved:   2026-01-31 12:00:00 UTC
+#   Expires: 2026-03-02 12:00:00 UTC
+#   Plain:   http://127.0.0.1:8787/7k2ma.txt
+#   Base64:  http://127.0.0.1:8787/7k2ma.base64
+#   Editor:  http://127.0.0.1:8787/7k2ma
+echo hello | curl --data-binary @- http://127.0.0.1:8787/
+
 # CLI write and read. A curl user agent gets the raw text.
 echo hello | curl --data-binary @- http://127.0.0.1:8787/cli-test
 curl http://127.0.0.1:8787/cli-test            # hello
@@ -125,6 +136,15 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/index.jsp   # 400
 # Append.
 echo " world" | curl --data-binary @- http://127.0.0.1:8787/cli-test/append
 curl http://127.0.0.1:8787/cli-test            # hello world
+
+# Change only the expiry from the command line. POST to /:note/expire, so the
+# body stays the same. The receipt starts with "Expiry set." and shows the new
+# Expires. It accepts 24h, 72h, 1w, or never.
+curl -d 'expires=24h'   http://127.0.0.1:8787/cli-test/expire
+curl -d 'expires=never' http://127.0.0.1:8787/cli-test/expire
+
+# Or save a new body and set the expiry in one call.
+curl -d 'text=hello&expires=24h' http://127.0.0.1:8787/cli-test
 ```
 
 Look at the local database:
@@ -222,6 +242,10 @@ BASE=https://<your-worker-domain>
 # 1. Root redirect.
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "$BASE/"
 
+# 1b. CLI write to the root. It saves under a new random ID. The receipt shows
+#     the ID and the read URLs.
+echo hello | curl --data-binary @- "$BASE/"
+
 # 2. Write, read, and output.
 echo hello | curl --data-binary @- "$BASE/smoke"
 curl "$BASE/smoke"          # hello
@@ -278,11 +302,15 @@ deploy once so Cloudflare updates the trigger.
 ### How expiry works
 
 The user picks an expiry in the status bar: `24h`, `72h`, `1w`, or `never`. The
-page sends it in the `expires` field. Each save sets
-`expires_at = now + the choice`. So a note expires after a period with no
-saves. A CLI save has no `expires` field, so it keeps the note's current
-expiry. A new note uses `NOTE_TTL_DAYS`. If you want a fixed expiry from the
-creation time, change the migration or the `saveNote` code.
+page sends it in the `expires` field when it creates a note and when the menu
+changes. An explicit choice sets `expires_at = now + the choice`; a normal
+content save keeps the current expiry. So a note expires after the chosen
+period from the last menu change or creation. A CLI `POST /:note/expire`
+(`curl -d 'expires=24h' .../my-note/expire`) changes the expiry only; the body
+and `updated_at` stay the same. A raw-body CLI save (`curl --data-binary ...`)
+keeps the note's current expiry. A new note uses `NOTE_TTL_DAYS`. If you want a
+fixed expiry from the creation time, change the migration or the `saveNote`
+code.
 
 ---
 

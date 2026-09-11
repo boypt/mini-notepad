@@ -13,8 +13,10 @@
  *                                    unknown == raw)
  *   - unknown file suffix        -> 400
  *   - POST /:note  (form `text`) -> save; empty `text` deletes
+ *   - POST /:note/expire (form `expires`) -> change expiry, keep the body
  *   - POST /:note  (raw body)    -> CLI save
  *   - POST /:note/append         -> CLI append
+ *   - POST /       (CLI)         -> CLI save to a new random id; receipt shows id
  *   - CLI user-agent             -> raw body, no HTML wrapper
  *
  * Security:
@@ -264,27 +266,17 @@ async function loadNote(env, id) {
  * are zstd-compressed. expires_at rules:
  *   - `expires` as a number  -> now + that many ms (an explicit choice wins)
  *   - `expires === null`     -> never expires (an explicit "never" wins)
- *   - `expires` undefined    -> keep the note's current expiry; a new note
+ *   - `expires` undefined    -> keep the current expiry on update; a new note
  *                               falls back to NOTE_TTL_DAYS (0 = never expires)
  */
 async function saveNote(env, id, text, { append = false, expires } = {}) {
   const now = Date.now();
+  const explicitExpiry = expires !== undefined;
 
-  // Only read the old row when it is needed: to append, or to inherit an expiry
-  // the user set earlier (a manual choice beats the default).
-  let savedExpires; // undefined = no existing row / not loaded
   let base = '';
   if (append) {
     const existing = await loadNote(env, id);
-    if (existing && !existing.expired) {
-      base = existing.text;
-      savedExpires = existing.row.expires_at ?? null;
-    }
-  } else if (expires === undefined) {
-    const row = await env.DB.prepare(
-      'SELECT expires_at FROM notes WHERE id = ? LIMIT 1',
-    ).bind(id).first();
-    if (row) savedExpires = row.expires_at ?? null;
+    if (existing && !existing.expired) base = existing.text;
   }
 
   let expiresAt;
@@ -292,8 +284,6 @@ async function saveNote(env, id, text, { append = false, expires } = {}) {
     expiresAt = null;
   } else if (typeof expires === 'number') {
     expiresAt = now + expires;
-  } else if (savedExpires !== undefined) {
-    expiresAt = savedExpires;
   } else {
     const ttlDays = Number(env.NOTE_TTL_DAYS ?? DEFAULT_TTL_DAYS);
     expiresAt = ttlDays > 0 ? now + ttlDays * DAY_MS : null;
@@ -303,21 +293,75 @@ async function saveNote(env, id, text, { append = false, expires } = {}) {
 
   const { bytes, encoding, rawSize } = encodeForStorage(body);
 
+  // Only write expires_at on an explicit choice. Otherwise the UPDATE leaves the
+  // stored expiry alone, so a content save cannot clobber a concurrent
+  // expiry-only change (no read-modify-write race). The INSERT value is the
+  // default TTL, used only when this creates a brand-new note.
+  const assignments = [
+    'content          = excluded.content',
+    'content_encoding = excluded.content_encoding',
+    'size_raw         = excluded.size_raw',
+    'size_stored      = excluded.size_stored',
+    'updated_at       = excluded.updated_at',
+  ];
+  if (explicitExpiry) assignments.push('expires_at       = excluded.expires_at');
+
   await env.DB.prepare(
     `INSERT INTO notes
        (id, content, content_encoding, size_raw, size_stored,
         created_at, updated_at, expires_at, is_protected)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
      ON CONFLICT(id) DO UPDATE SET
-       content          = excluded.content,
-       content_encoding = excluded.content_encoding,
-       size_raw         = excluded.size_raw,
-       size_stored      = excluded.size_stored,
-       updated_at       = excluded.updated_at,
-       expires_at       = excluded.expires_at`,
+       ${assignments.join(',\n       ')}`,
   ).bind(id, bytes, encoding, rawSize, bytes.byteLength, now, now, expiresAt).run();
 
+  if (!explicitExpiry) {
+    // Report the expiry the row actually has now, not the insert default.
+    const row = await env.DB.prepare(
+      'SELECT expires_at FROM notes WHERE id = ? LIMIT 1',
+    ).bind(id).first();
+    return { updatedAt: now, expiresAt: row ? (row.expires_at ?? null) : null };
+  }
   return { updatedAt: now, expiresAt };
+}
+
+/**
+ * Change only a note's expiry. Content and updated_at are left untouched.
+ * `expires` is a number of ms from now, or `null` for "never". Returns null
+ * when the note does not exist.
+ */
+async function setNoteExpiry(env, id, expires) {
+  const now = Date.now();
+  const row = await env.DB.prepare(
+    'SELECT created_at, updated_at, expires_at FROM notes WHERE id = ? LIMIT 1',
+  ).bind(id).first();
+  if (!row) return null;
+  // Treat an already-expired note as missing, matching loadNote, so an expired
+  // note cannot be revived by extending its expiry.
+  if (row.expires_at != null && row.expires_at < now) return null;
+  const expiresAt = expires === null ? null : now + expires;
+  await env.DB.prepare('UPDATE notes SET expires_at = ? WHERE id = ?')
+    .bind(expiresAt, id).run();
+  return {
+    createdAt: row.created_at ?? null,
+    updatedAt: row.updated_at ?? null,
+    expiresAt,
+  };
+}
+
+/**
+ * Pick a random note id that is not already taken. Used by the root POST path so
+ * a CLI upload cannot silently overwrite an existing note. Retries a few times;
+ * a collision after that is vanishingly unlikely.
+ */
+async function freshNoteId(env) {
+  for (let i = 0; i < 5; i++) {
+    const id = randomNoteId();
+    const row = await env.DB.prepare('SELECT id FROM notes WHERE id = ? LIMIT 1')
+      .bind(id).first();
+    if (!row) return id;
+  }
+  return randomNoteId();
 }
 
 /** Delete every row whose expiry has passed (used by the Cron Trigger). */
@@ -386,6 +430,24 @@ async function handlePost(request, env, id, mode) {
   const cli = isCliUserAgent(userAgent);
   const raw = await request.text();
   const url = new URL(request.url);
+
+  // Expiry-only update: `POST /:note/expire` with form `expires`. The body is
+  // left untouched. This is a dedicated route so a raw CLI body that happens to
+  // start with `expires=` is still stored as text.
+  if (mode === 'expire') {
+    const params = new URLSearchParams(raw);
+    if (!cli && !verifyCsrf(env, id, params.get('csrf'))) return forbidden();
+    const expires = resolveExpiryToken(params.get('expires'));
+    if (expires === undefined) return badRequest();
+    const saved = await setNoteExpiry(env, id, expires);
+    if (!saved) return notFound();
+    if (cli) return cliReceipt(url, id, 'Expiry set', saved.updatedAt, saved.expiresAt);
+    return jsonOk({
+      created_at: saved.createdAt,
+      updated_at: saved.updatedAt,
+      expires_at: saved.expiresAt,
+    });
+  }
 
   // Web (form) save path: the autosave XHR posts `text=...` (and `expires=...`).
   // A browser must send the per-note CSRF token from the page. Whitelisted CLI
@@ -977,12 +1039,13 @@ main {
         });
     }
 
-    function send(body, onDone) {
+    function send(body, onDone, url) {
         var request = new XMLHttpRequest();
-        request.open('POST', window.location.href, true);
+        request.open('POST', url || window.location.href, true);
         request.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
         request.onload = function () {
-            if (request.readyState === 4 && request.status >= 200 && request.status < 300) {
+            var ok = request.readyState === 4 && request.status >= 200 && request.status < 300;
+            if (ok) {
                 try {
                     var data = JSON.parse(request.responseText);
                     if (data && data.deleted) {
@@ -1002,17 +1065,27 @@ main {
                     // Non-JSON responses are ignored.
                 }
             }
-            if (onDone) onDone();
+            if (onDone) onDone(ok);
         };
         request.onerror = function () {
-            if (onDone) onDone();
+            if (onDone) onDone(false);
         };
         request.send(body);
     }
 
     function payload(value) {
-        return 'text=' + encodeURIComponent(value) +
-            '&expires=' + encodeURIComponent(expiry.value) +
+        var body = 'text=' + encodeURIComponent(value) +
+            '&csrf=' + encodeURIComponent(meta.csrf || '');
+        // A brand-new note only gets an expiry when the first save creates it.
+        if (meta.createdAt == null) {
+            body += '&expires=' + encodeURIComponent(expiry.value);
+        }
+        return body;
+    }
+
+    // Change only the expiry of an existing note; the body is left untouched.
+    function expiryPayload() {
+        return 'expires=' + encodeURIComponent(expiry.value) +
             '&csrf=' + encodeURIComponent(meta.csrf || '');
     }
 
@@ -1127,7 +1200,20 @@ main {
     });
 
     expiry.addEventListener('change', function () {
-        save(true);
+        // An unsaved note gets its expiry on the first content save.
+        if (meta.createdAt == null) return;
+
+        send(expiryPayload(), function (ok) {
+            if (ok) {
+                savedAtEl.textContent = 'Expiry saved';
+                window.setTimeout(function () {
+                    showSavedAt(meta.updatedAt);
+                }, 1500);
+            } else {
+                // Put the select back to match what the server still has.
+                pickExpiry();
+            }
+        }, '/' + NOTE_ID + '/expire');
     });
 
     outputMode.addEventListener('change', function () {
@@ -1160,6 +1246,14 @@ export default {
     const segments = url.pathname.split('/').filter(Boolean);
 
     if (segments.length === 0) {
+      // Root write: a CLI upload (curl/wget) to `/` gets a fresh random id and
+      // is saved there. The plain-text receipt prints the generated id and its
+      // read URLs. Browsers still get the random-note redirect.
+      if (request.method === 'POST') {
+        const userAgent = request.headers.get('user-agent') || '';
+        if (!isCliUserAgent(userAgent)) return forbidden();
+        return handlePost(request, env, await freshNoteId(env), '');
+      }
       return redirect('/' + randomNoteId());
     }
 

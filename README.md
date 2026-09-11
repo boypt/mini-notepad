@@ -32,10 +32,12 @@ apply the database schema once (see [Setup](#setup)).
 | Route | What it does |
 | --- | --- |
 | `GET /` | Sends a `302` redirect to a new random note ID. |
+| `POST /` (raw body, CLI) | CLI save to a new random note ID. The receipt shows the ID. |
 | `GET /:note` | Shows the HTML editor. |
 | `GET /:note.txt` | Shows the note as plain text. |
 | `GET /:note.base64` | Shows the note as Base64. |
 | `POST /:note` (form field `text`) | Saves the note. An empty `text` deletes it. |
+| `POST /:note/expire` (form field `expires`) | Changes the expiry only. Keeps the body. |
 | `POST /:note` (raw body) | CLI save. |
 | `POST /:note/append` (raw body) | CLI append. |
 
@@ -47,6 +49,8 @@ Notes:
   blind POST returns `403`.
 - `curl` and `wget` user agents may save without a token. On GET they get the
   raw note body, not HTML.
+- A CLI save to `/` makes a new random ID and saves the body there. The receipt
+  prints the new ID. A browser POST to `/` returns `403`.
 - All responses use `no-store` and `X-Robots-Tag: noindex, nofollow`.
 
 ## Output modes
@@ -78,6 +82,25 @@ Base64:  https://<your-worker>/my-note.base64
 Editor:  https://<your-worker>/my-note
 ```
 
+Save without picking an ID. Post to `/`. The Worker makes a random ID and
+prints it in the receipt:
+
+```sh
+echo "hello" | curl --data-binary @- https://<your-worker>/
+```
+
+```text
+Saved.
+Note:    7k2ma
+Saved:   2026-01-31 12:00:00 UTC
+Expires: 2026-03-02 12:00:00 UTC
+Plain:   https://<your-worker>/7k2ma.txt
+Base64:  https://<your-worker>/7k2ma.base64
+Editor:  https://<your-worker>/7k2ma
+```
+
+The `Note:` line is the new random ID. The receipt uses it in the read URLs.
+
 Read it back:
 
 ```sh
@@ -98,6 +121,48 @@ curl https://<your-worker>/my-note.base64
 ```
 
 A `curl` user agent gets the raw note text, not the HTML page.
+
+### Expiry
+
+A raw-body save (`--data-binary`) has no expiry choice. It keeps the note's
+current expiry. A new note starts with `NOTE_TTL_DAYS` (default `30` days).
+
+To change **only the expiry**, POST to `/:note/expire` with `expires`. The note
+body stays the same:
+
+```sh
+curl -d 'expires=24h'   https://<your-worker>/my-note/expire
+curl -d 'expires=72h'   https://<your-worker>/my-note/expire
+curl -d 'expires=1w'    https://<your-worker>/my-note/expire
+curl -d 'expires=never' https://<your-worker>/my-note/expire
+```
+
+The receipt confirms it. The body and the `Saved:` time do not change:
+
+```text
+Expiry set.
+Note:    my-note
+Saved:   2026-01-31 12:00:00 UTC
+Expires: 2026-02-01 12:00:00 UTC
+Plain:   https://<your-worker>/my-note.txt
+Base64:  https://<your-worker>/my-note.base64
+Editor:  https://<your-worker>/my-note
+```
+
+To save a new body and set the expiry in one call, send `text` and `expires`:
+
+```sh
+curl -d 'text=hello&expires=24h' https://<your-worker>/my-note
+```
+
+`expires` accepts `24h`, `72h`, `1w`, or `never`. For an expiry-only change, an
+unknown or empty value returns `400`, and a missing note returns `404`.
+
+You can also post to `/` to make a new note. A new note needs `text`:
+
+```sh
+curl -d 'text=hello&expires=24h' https://<your-worker>/
+```
 
 ## Security
 
@@ -128,9 +193,13 @@ already in `wrangler.toml`.
 
 - The web editor sends an `expires` value: `24h`, `72h`, `1w`, or `never`.
 - The Worker sets `expires_at = now + expires`.
-- A CLI save has no `expires` value. Then the Worker keeps the note's current
-  expiry. A new note starts with `NOTE_TTL_DAYS` (default `30`). Set
+- A raw-body CLI save has no `expires` value. Then the Worker keeps the note's
+  current expiry. A new note starts with `NOTE_TTL_DAYS` (default `30`). Set
   `NOTE_TTL_DAYS = "0"` to never expire.
+- The web editor sends `expires` only when it creates a note or when you change
+  the menu. Content saves keep the current expiry.
+- A CLI `POST /:note/expire` with `expires` (`24h`, `72h`, `1w`, `never`)
+  changes the expiry only and keeps the body. See [Command line](#command-line).
 - `created_at` is set one time. `updated_at` changes on every save.
 - A Cron Trigger runs at `0 3 * * *` (03:00 UTC every day). It deletes notes
   that are past `expires_at`.
@@ -189,6 +258,7 @@ npx wrangler deploy
 BASE=http://127.0.0.1:8787
 
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "$BASE/"
+echo hello | curl --data-binary @- "$BASE/"          # saves under a new ID; receipt shows it
 echo hello | curl --data-binary @- "$BASE/cli-test"
 curl "$BASE/cli-test"            # hello
 curl "$BASE/cli-test.txt"        # hello
