@@ -473,6 +473,9 @@ body {
     gap: 8px;
     padding: 8px 12px;
 }
+.toolbar {
+    flex-wrap: wrap;
+}
 .statusbar {
     padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
     font-size: 12px;
@@ -485,10 +488,10 @@ button.icon {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 36px;
-    height: 36px;
+    width: 28px;
+    height: 28px;
     padding: 0;
-    font-size: 18px;
+    font-size: 15px;
     line-height: 1;
     color: inherit;
     background: #fff;
@@ -533,6 +536,29 @@ select {
     padding: 6px 8px;
     max-width: 45vw;
 }
+.sep {
+    width: 1px;
+    align-self: stretch;
+    background: #d3d8de;
+    margin: 2px 4px;
+}
+.fontsize {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+#font-size {
+    width: 3.5em;
+    height: 28px;
+    padding: 0 2px;
+    text-align: center;
+    font: inherit;
+    font-size: 13px;
+    color: inherit;
+    background: #fff;
+    border: 1px solid #d3d8de;
+    border-radius: 6px;
+}
 main {
     flex: 1 1 auto;
     min-height: 0;
@@ -549,7 +575,7 @@ main {
     border-radius: 6px;
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
     font-size: 100%;
-    line-height: 1.5rem;
+    line-height: 1.5;
 }
 .editor:focus-within {
     border-color: #5b8def;
@@ -596,7 +622,8 @@ main {
         color: #f8f8f2;
     }
     button.icon,
-    select {
+    select,
+    #font-size {
         background: #282923;
         border-color: #4a4b45;
     }
@@ -626,6 +653,9 @@ main {
         background: #23241f;
         border-right-color: #3a3b35;
         color: #6b6d66;
+    }
+    .sep {
+        background: #4a4b45;
     }
     #content {
         color: #f8f8f2;
@@ -666,6 +696,15 @@ main {
     <header class="toolbar">
         <button type="button" class="icon" id="new-note" title="New note" aria-label="New note">🗋</button>
         <button type="button" class="icon" id="save-note" title="Save" aria-label="Save" disabled>💾</button>
+        <span class="sep" role="separator" aria-orientation="vertical"></span>
+        <button type="button" class="icon" id="copy-note" title="Copy" aria-label="Copy">🗐</button>
+        <button type="button" class="icon" id="paste-note" title="Paste" aria-label="Paste">📋</button>
+        <span class="sep" role="separator" aria-orientation="vertical"></span>
+        <div class="fontsize" role="group" aria-label="Font size">
+            <button type="button" class="icon" id="font-decrease" title="Smaller text" aria-label="Smaller text">−</button>
+            <input type="text" id="font-size" inputmode="numeric" maxlength="2" value="16" aria-label="Font size">
+            <button type="button" class="icon" id="font-increase" title="Larger text" aria-label="Larger text">+</button>
+        </div>
         <span class="grow"></span>
         <select id="output-mode" aria-label="Output format">
             <option value="" selected disabled>Output&hellip;</option>
@@ -674,7 +713,7 @@ main {
         </select>
     </header>
     <main>
-        <div class="editor">
+        <div class="editor" id="editor">
             <div class="gutter" id="gutter" aria-hidden="true"><pre class="gutter-lines" id="gutter-lines">1</pre></div>
             <textarea id="content" wrap="off" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-gramm="false" data-gramm_editor="false" data-enable-grammarly="false">${escapeHtml(text)}</textarea>
         </div>
@@ -709,6 +748,12 @@ main {
     var saveButton = document.getElementById('save-note');
     var gutter = document.getElementById('gutter');
     var gutterLines = document.getElementById('gutter-lines');
+    var editor = document.getElementById('editor');
+    var fontSizeInput = document.getElementById('font-size');
+    var fontDecrease = document.getElementById('font-decrease');
+    var fontIncrease = document.getElementById('font-increase');
+    var copyButton = document.getElementById('copy-note');
+    var pasteButton = document.getElementById('paste-note');
 
     var meta;
     try {
@@ -786,6 +831,86 @@ main {
         for (var n = first + 1; n <= last; n++) numbers.push(n);
         gutterLines.textContent = numbers.join('\\n');
         gutterLines.style.transform = 'translateY(' + (first * lineHeight - textarea.scrollTop) + 'px)';
+    }
+
+    var FONT_MIN = 10;
+    var FONT_MAX = 40;
+    var FONT_KEY = 'web-notepad-font-size';
+
+    function applyFontSize(px) {
+        var size = Math.max(FONT_MIN, Math.min(FONT_MAX, Math.round(px) || 16));
+        editor.style.fontSize = size + 'px';
+        fontSizeInput.value = String(size);
+        gutterLineHeight = 0; // line height changed; re-measure the gutter
+        updateGutter();
+        try {
+            window.localStorage.setItem(FONT_KEY, String(size));
+        } catch (err) {
+            // Storage can be blocked; the size still applies for this page.
+        }
+    }
+
+    function stepFontSize(delta) {
+        var current = parseInt(fontSizeInput.value, 10);
+        if (isNaN(current)) current = 16;
+        applyFontSize(current + delta);
+    }
+
+    function initFontSize() {
+        var saved = null;
+        try {
+            saved = window.localStorage.getItem(FONT_KEY);
+        } catch (err) {
+            saved = null;
+        }
+        applyFontSize(saved ? parseInt(saved, 10) : 16);
+    }
+
+    function insertAtCursor(text) {
+        var start = textarea.selectionStart || 0;
+        var end = textarea.selectionEnd || 0;
+        var value = textarea.value;
+        textarea.value = value.slice(0, start) + text + value.slice(end);
+        var caret = start + text.length;
+        textarea.selectionStart = caret;
+        textarea.selectionEnd = caret;
+        updateSaveState();
+        updateGutter();
+        textarea.focus();
+    }
+
+    function copyFromEditor() {
+        var value = textarea.value;
+        var start = textarea.selectionStart || 0;
+        var end = textarea.selectionEnd || 0;
+        if (end > start) value = value.slice(start, end);
+
+        var clipboard = window.navigator && window.navigator.clipboard;
+        if (clipboard && clipboard.writeText) {
+            clipboard.writeText(value).catch(function () {});
+            return;
+        }
+        // Fallback for browsers without the async Clipboard API.
+        textarea.focus();
+        textarea.select();
+        try {
+            document.execCommand('copy');
+        } catch (err) {
+            // Nothing else we can do here.
+        }
+    }
+
+    function pasteIntoEditor() {
+        var clipboard = window.navigator && window.navigator.clipboard;
+        if (!clipboard || !clipboard.readText) {
+            window.alert('Paste is not supported here. Use Ctrl/Cmd+V.');
+            return;
+        }
+        clipboard.readText().then(function (text) {
+            if (text) insertAtCursor(text);
+        }).catch(function () {
+            window.alert('Could not read the clipboard. Use Ctrl/Cmd+V.');
+        });
     }
 
     function send(body, onDone) {
@@ -882,14 +1007,40 @@ main {
         new window.ResizeObserver(updateGutter).observe(textarea);
     }
 
+    fontDecrease.addEventListener('click', function () {
+        stepFontSize(-1);
+    });
+    fontIncrease.addEventListener('click', function () {
+        stepFontSize(1);
+    });
+    fontSizeInput.addEventListener('change', function () {
+        stepFontSize(0);
+    });
+    fontSizeInput.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter') fontSizeInput.blur();
+    });
+
+    copyButton.addEventListener('click', copyFromEditor);
+    pasteButton.addEventListener('click', pasteIntoEditor);
+
     document.getElementById('new-note').addEventListener('click', function () {
-        var input = window.prompt('Note ID', '');
+        var input = window.prompt(
+            'Enter a note ID for the new note.\\n\\n' +
+            'Allowed characters: letters (A-Z, a-z), digits (0-9), hyphen (-) and underscore (_).\\n' +
+            'No spaces or other symbols.\\n\\n' +
+            'For example: project-notes-2026',
+            ''
+        );
         if (input === null) return;
 
         // Keep only characters a note id accepts.
         var id = input.replace(/[^a-zA-Z0-9_-]/g, '');
         if (id.length === 0) {
-            window.alert('Enter a valid note ID: letters, digits, "-" and "_".');
+            window.alert(
+                'That note ID has no valid characters.\\n\\n' +
+                'Use letters (A-Z, a-z), digits (0-9), hyphen (-) or underscore (_).\\n' +
+                'Spaces and other symbols are not allowed.'
+            );
             return;
         }
 
@@ -918,6 +1069,7 @@ main {
     pickExpiry();
     updateSaveState();
     updateGutter();
+    initFontSize();
     textarea.focus();
     autosave();
 })();
