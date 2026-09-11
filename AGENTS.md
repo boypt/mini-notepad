@@ -21,8 +21,8 @@ Trigger. No runtime dependencies; `wrangler` is the only dev dependency.
 ## Verify changes
 
 - There is **no test runner** (`npm test` does not exist). Minimum check:
-  `node --check src/index.js`, then run the smoke test from README ("Smoke
-  test") or DEPLOY.md §9 against a running Worker.
+  `node --check src/index.js`, then run the smoke test below or DEPLOY.md §9
+  against a running Worker.
 - Helpers are exported specifically so they can be imported and exercised by
   plain Node: `randomNoteId`, `compress`, `encodeForStorage`,
   `resolveExpiryToken`, `decompress`, `renderPage`.
@@ -65,3 +65,34 @@ npm run db:gc              # one-off remote GC of expired notes
   no backfill.
 - `is_protected` / `password_hash` / `password_salt` / `password_algo` columns
   exist but are not enforced yet.
+
+## HTTP behavior
+
+- A note ID may be any length and uses only `a-z`, `A-Z`, `0-9`, `_`, and `-`
+  (`NOTE_ID_RE`). A browser `GET /` and a CLI `POST /` generate a 5-character
+  ID from the unambiguous alphabet `234579abcdefghjkmnpqrstwxyz`.
+- A browser form save needs the per-note CSRF token (blind POST → 403). Raw CLI
+  writes are limited to the `curl`/`wget` user agents; on GET they receive the
+  raw body instead of the HTML editor.
+- Every response sets `Cache-Control: no-store` and
+  `X-Robots-Tag: noindex, nofollow`.
+- A form save and `POST /:note/expire` return JSON
+  `{ created_at, updated_at, expires_at }` (`expires_at` may be `null`). An
+  empty `text` delete returns `{ "deleted": true }`. CLI writes get a plain-text
+  receipt instead. An unknown file suffix (for example `/index.jsp`) returns
+  `400`.
+
+## Smoke test
+
+```sh
+BASE=http://127.0.0.1:8787
+
+curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "$BASE/"
+echo hello | curl --data-binary @- "$BASE/"          # new random ID; receipt shows it
+echo hello | curl --data-binary @- "$BASE/cli-test"
+curl "$BASE/cli-test"            # hello
+curl "$BASE/cli-test.txt"        # hello
+curl "$BASE/cli-test.base64"     # aGVsbG8=
+echo " world" | curl --data-binary @- "$BASE/cli-test/append"
+curl "$BASE/cli-test"            # hello world
+```
