@@ -167,14 +167,23 @@ export function resolveExpiryToken(token) {
 
 /**
  * Decompress bytes back to a UTF-8 string. `encoding` is the value stored in
- * notes.content_encoding; `gzip` is still decoded so data written by an
- * earlier gzip build remains readable.
+ * notes.content_encoding. `zstd` is current; `gzip` and `identity` (or the
+ * legacy `none`) are still decoded so older rows stay readable. Any other
+ * value is rejected instead of being guessed.
  */
 export function decompress(bytes, encoding = CODEC) {
   const input = toBytes(bytes);
-  if (encoding === 'gzip') return decoder.decode(zlib.gunzipSync(input));
-  if (encoding === 'identity' || encoding === 'none') return decoder.decode(input);
-  return decoder.decode(zlib.zstdDecompressSync(input));
+  switch (encoding) {
+    case 'gzip':
+      return decoder.decode(zlib.gunzipSync(input));
+    case 'identity':
+    case 'none':
+      return decoder.decode(input);
+    case 'zstd':
+      return decoder.decode(zlib.zstdDecompressSync(input));
+    default:
+      throw new Error(`Unknown content_encoding: ${encoding}`);
+  }
 }
 
 /**
@@ -510,8 +519,7 @@ button.icon:disabled {
     background: #dcebff;
 }
 button.icon:focus-visible,
-select:focus-visible,
-#content:focus-visible {
+select:focus-visible {
     outline: 2px solid #5b8def;
     outline-offset: 1px;
 }
@@ -531,19 +539,51 @@ main {
     display: flex;
     padding: 0 12px;
 }
+.editor {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    overflow: hidden;
+    background: #fff;
+    border: 1px solid #d3d8de;
+    border-radius: 6px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: 100%;
+    line-height: 1.5rem;
+}
+.editor:focus-within {
+    border-color: #5b8def;
+}
+.gutter {
+    flex: 0 0 auto;
+    overflow: hidden;
+    padding: 16px 8px;
+    background: #f6f8fa;
+    border-right: 1px solid #e6e9ed;
+    color: #9aa4af;
+    text-align: right;
+    user-select: none;
+}
+.gutter-lines {
+    margin: 0;
+    font: inherit;
+    line-height: inherit;
+    white-space: pre;
+    text-align: right;
+    will-change: transform;
+}
 #content {
     flex: 1 1 auto;
     width: 100%;
     margin: 0;
     padding: 16px;
-    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-    font-size: 100%;
-    line-height: 1.5;
+    background: transparent;
+    font: inherit;
     tab-size: 4;
-    overflow-y: auto;
+    white-space: pre;
+    overflow: auto;
     resize: none;
-    border: 1px solid #d3d8de;
-    border-radius: 6px;
+    border: 0;
     outline: none;
 }
 #printable {
@@ -578,13 +618,26 @@ main {
     #save-note:not(:disabled):hover {
         background: #253652;
     }
-    #content {
+    .editor {
         background: #282923;
-        color: #f8f8f2;
         border-color: #4a4b45;
+    }
+    .gutter {
+        background: #23241f;
+        border-right-color: #3a3b35;
+        color: #6b6d66;
+    }
+    #content {
+        color: #f8f8f2;
     }
     .statusbar {
         color: #b6b7ae;
+    }
+}
+
+@media (max-width: 560px) {
+    .gutter {
+        display: none;
     }
 }
 
@@ -621,7 +674,10 @@ main {
         </select>
     </header>
     <main>
-        <textarea id="content" autocomplete="off" autocapitalize="off">${escapeHtml(text)}</textarea>
+        <div class="editor">
+            <div class="gutter" id="gutter" aria-hidden="true"><pre class="gutter-lines" id="gutter-lines">1</pre></div>
+            <textarea id="content" wrap="off" autocomplete="off" autocapitalize="off">${escapeHtml(text)}</textarea>
+        </div>
     </main>
     <footer class="statusbar">
         <span id="saved-at">Not saved yet</span>
@@ -651,6 +707,8 @@ main {
     var expiry = document.getElementById('expiry');
     var savedAtEl = document.getElementById('saved-at');
     var saveButton = document.getElementById('save-note');
+    var gutter = document.getElementById('gutter');
+    var gutterLines = document.getElementById('gutter-lines');
 
     var meta;
     try {
@@ -699,6 +757,35 @@ main {
 
     function updateSaveState() {
         saveButton.disabled = textarea.value === content;
+    }
+
+    var gutterLineHeight = 0;
+
+    // Draw only the line numbers near the viewport, then shift them to match
+    // the textarea scroll position.
+    function updateGutter() {
+        if (!gutter || !gutterLines || !window.getComputedStyle) return;
+        if (!gutterLineHeight) {
+            var measured = parseFloat(window.getComputedStyle(gutterLines).lineHeight);
+            gutterLineHeight = measured > 0 ? measured : 24;
+        }
+
+        var value = textarea.value;
+        var total = 1;
+        for (var i = 0; i < value.length; i++) {
+            if (value.charCodeAt(i) === 10) total++;
+        }
+        gutter.style.width = 'calc(' + Math.max(2, String(total).length) + 'ch + 18px)';
+
+        var lineHeight = gutterLineHeight;
+        var first = Math.max(0, Math.floor(textarea.scrollTop / lineHeight));
+        var rows = Math.ceil((textarea.clientHeight || 0) / lineHeight) + 1;
+        var last = Math.min(total, first + rows);
+
+        var numbers = [];
+        for (var n = first + 1; n <= last; n++) numbers.push(n);
+        gutterLines.textContent = numbers.join('\\n');
+        gutterLines.style.transform = 'translateY(' + (first * lineHeight - textarea.scrollTop) + 'px)';
     }
 
     function send(body, onDone) {
@@ -770,6 +857,30 @@ main {
     });
 
     textarea.addEventListener('input', updateSaveState);
+    textarea.addEventListener('input', updateGutter);
+
+    var gutterTicking = false;
+    textarea.addEventListener('scroll', function () {
+        if (gutterTicking) return;
+        gutterTicking = true;
+        if (window.requestAnimationFrame) {
+            window.requestAnimationFrame(function () {
+                gutterTicking = false;
+                updateGutter();
+            });
+        } else {
+            gutterTicking = false;
+            updateGutter();
+        }
+    }, { passive: true });
+
+    window.addEventListener('resize', function () {
+        gutterLineHeight = 0;
+        updateGutter();
+    });
+    if (window.ResizeObserver) {
+        new window.ResizeObserver(updateGutter).observe(textarea);
+    }
 
     document.getElementById('new-note').addEventListener('click', function () {
         var input = window.prompt('Note ID', '');
@@ -806,6 +917,7 @@ main {
     showSavedAt(meta.updatedAt);
     pickExpiry();
     updateSaveState();
+    updateGutter();
     textarea.focus();
     autosave();
 })();
