@@ -676,7 +676,7 @@ main {
     <main>
         <div class="editor">
             <div class="gutter" id="gutter" aria-hidden="true"><pre class="gutter-lines" id="gutter-lines">1</pre></div>
-            <textarea id="content" wrap="off" autocomplete="off" autocapitalize="off">${escapeHtml(text)}</textarea>
+            <textarea id="content" wrap="off" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-gramm="false" data-gramm_editor="false" data-enable-grammarly="false">${escapeHtml(text)}</textarea>
         </div>
     </main>
     <footer class="statusbar">
