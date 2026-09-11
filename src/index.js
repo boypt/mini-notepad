@@ -484,8 +484,10 @@ main {
     width: 100%;
     margin: 0;
     padding: 16px;
-    font: inherit;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
     font-size: 100%;
+    line-height: 1.5;
+    tab-size: 4;
     overflow-y: auto;
     resize: none;
     border: 1px solid #d3d8de;
@@ -549,6 +551,7 @@ main {
         display: block;
         white-space: pre-wrap;
         word-break: break-word;
+        font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
     }
 }
     </style>
