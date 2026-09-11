@@ -1,76 +1,78 @@
-# 部署指南 — Cloudflare Workers + D1
+# Deploy guide — Cloudflare Workers + D1
 
-本文档面向把 `worker/` 部署到 Cloudflare 生产环境的完整流程，包括本地开发、
-D1 建库与迁移、正式部署、自定义域名、灰度/回滚、垃圾回收与常见问题排查。
+This guide shows how to put the notepad on Cloudflare. It covers local
+development, the D1 database, deployment, custom domains, rollback, garbage
+collection, and common problems.
 
-> 快速开始见 [README.md](./README.md)；本文件是更详细的生产部署说明。
+See [README.md](./README.md) for a short overview.
 
 ---
 
-## 1. 前置条件
+## 1. What you need
 
-| 项目 | 要求 |
+| Item | Requirement |
 | --- | --- |
-| Node.js | 18 及以上（建议 20+；本仓库验证于 Node 24） |
-| 包管理器 | npm（仓库使用 `package.json` + `npx wrangler`） |
-| Cloudflare 账号 | 需要有 Workers 与 D1 权限 |
-| 认证方式 | 本地用 `wrangler login`；CI 用 API Token |
-| 兼容标志 | 已在 `wrangler.toml` 配置 `nodejs_compat`（zstd 依赖 `node:zlib`） |
+| Node.js | Version 18 or newer. Version 20+ is better. This repo was tested on Node 24. |
+| Package manager | npm. The repo uses `package.json` and `npx wrangler`. |
+| Cloudflare account | You need Workers and D1 permission. |
+| Login | Use `wrangler login` on your computer. Use an API token in CI. |
+| Compat flag | `wrangler.toml` already sets `nodejs_compat`. zstd needs `node:zlib`. |
 
-依赖安装（会拉取 `wrangler`）：
+Install the tools:
 
 ```sh
-cd worker
 npm install
 ```
 
 ---
 
-## 2. 架构概览（部署前需了解）
+## 2. How it works
 
 ```
-浏览器 / curl
+Browser / curl
    │
    ▼
-Cloudflare Worker  (worker/src/index.js)
-   ├── 静态资源  public/favicon.ico  → Workers Static Assets 直接返回
-   ├── 笔记路由  /:note, /:note/:mode → Worker fetch 处理
-   └── D1 绑定   env.DB              → notes 表（zstd 压缩后的 BLOB）
+Cloudflare Worker  (src/index.js)
+   ├── static file  public/favicon.ico  → Workers Static Assets
+   ├── note routes  /:note, /:note.txt, /:note.base64  → Worker fetch
+   └── D1 binding   env.DB              → notes table (BLOB)
              ▲
-Cron Trigger └─ 每天 03:00 UTC 调用 scheduled 清理过期行
+Cron Trigger └─ runs at 03:00 UTC every day to delete expired notes
 ```
 
-- **一个 Worker + 一个 D1 数据库 + 一个 Cron Trigger**，无其他依赖。
-- 笔记正文写入 D1 的 `content`（BLOB）：小于 128 字节存为明文
-  （`content_encoding = 'identity'`），其余用 **zstd** 压缩
-  （`content_encoding = 'zstd'`）。
-- 表结构含 `created_at` / `updated_at` / `expires_at`，以及预留的密码列
-  （`is_protected` / `password_hash` / `password_salt` / `password_algo`）。
-- 应用假定部署在**站点根路径**（重定向与 favicon 使用 `/<id>`、`/favicon.ico`）。
+- The app uses one Worker, one D1 database, and one Cron Trigger. Nothing else.
+- The Worker saves the note body in `content` (a BLOB).
+  - A body under 128 bytes is saved as plain text
+    (`content_encoding = 'identity'`).
+  - A bigger body is compressed with zstd (`content_encoding = 'zstd'`).
+- The table has `created_at`, `updated_at`, and `expires_at`. It also has
+  reserved password columns: `is_protected`, `password_hash`, `password_salt`,
+  and `password_algo`.
+- The app must run at the root of a site. It uses `/<id>` and `/favicon.ico`.
 
 ---
 
-## 3. 登录 Cloudflare
+## 3. Log in to Cloudflare
 
 ```sh
-# 本地交互式登录（会打开浏览器）
+# Log in on your computer. This opens a browser.
 npx wrangler login
 
-# 确认身份
+# Check who you are.
 npx wrangler whoami
 ```
 
-CI / 无浏览器环境改用 API Token（见第 8 节）。
+For CI or a computer without a browser, use an API token. See section 8.
 
 ---
 
-## 4. 创建 D1 数据库
+## 4. Create the D1 database
 
 ```sh
 npx wrangler d1 create minimalist-web-notepad
 ```
 
-命令会输出数据库信息，例如：
+The command prints the database details. Example:
 
 ```
 [[d1_databases]]
@@ -79,102 +81,103 @@ database_name = "minimalist-web-notepad"
 database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ```
 
-把 `database_id` 填入 `worker/wrangler.toml`，替换占位符
-`REPLACE_WITH_YOUR_DATABASE_ID`。
+Put the `database_id` in `wrangler.toml`. Replace
+`REPLACE_WITH_YOUR_DATABASE_ID`.
 
-可选参数：
+Optional flags:
 
-- `--location apac` — 指定主位置提示，取值
-  `weur` / `eeur` / `apac` / `oc` / `wnam` / `enam`。
-- `--jurisdiction eu|fedramp|us` — 数据驻留限制（设置了则忽略 location）。
-- `--update-config` — 自动把绑定写入 wrangler 配置，免手改。
+- `--location apac` — sets the primary location. Values: `weur`, `eeur`,
+  `apac`, `oc`, `wnam`, `enam`.
+- `--jurisdiction eu|fedramp|us` — limits where the data lives. If you set
+  this, `--location` is ignored.
+- `--update-config` — writes the binding into the wrangler config for you.
 
-> 注意：D1 数据库**只能创建在远程**，本地开发用的是 Miniflare 模拟的本地库，
-> 两者相互独立。
+> Note: You can only create a D1 database in the cloud. Local development uses
+> a local database made by Miniflare. The two databases are separate.
 
 ---
 
-## 5. 本地开发
+## 5. Local development
 
 ```sh
-cd worker
-
-# 1) 在本地库上应用表结构（生成 .wrangler/state 下的本地 SQLite）
+# 1. Apply the schema to the local database.
 npx wrangler d1 migrations apply minimalist-web-notepad --local
 
-# 2) 启动本地 dev server（默认 http://127.0.0.1:8787）
+# 2. Start the local dev server (default http://127.0.0.1:8787).
 npm run dev
 ```
 
-本地验证清单：
+Local checks:
 
 ```sh
-# 根路径应 302 到随机 5 位 ID
+# The root path should redirect (302) to a random 5-character ID.
 curl -s -D - -o /dev/null http://127.0.0.1:8787/
 
-# CLI 写入 + 读取（curl UA 自动返回原文）
+# CLI write and read. A curl user agent gets the raw text.
 echo hello | curl --data-binary @- http://127.0.0.1:8787/cli-test
 curl http://127.0.0.1:8787/cli-test            # hello
 
-# 输出模式（文件名后缀）
-curl http://127.0.0.1:8787/cli-test.txt          # hello
-curl http://127.0.0.1:8787/cli-test.base64       # aGVsbG8=
+# Output by file suffix.
+curl http://127.0.0.1:8787/cli-test.txt        # hello
+curl http://127.0.0.1:8787/cli-test.base64     # aGVsbG8=
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/index.jsp   # 400
 
-# 追加
+# Append.
 echo " world" | curl --data-binary @- http://127.0.0.1:8787/cli-test/append
 curl http://127.0.0.1:8787/cli-test            # hello world
 ```
 
-查看本地库内容：
+Look at the local database:
 
 ```sh
 npx wrangler d1 execute minimalist-web-notepad --local \
   --command "SELECT id, content_encoding, size_raw, size_stored, expires_at FROM notes"
 ```
 
-本地状态保存在 `worker/.wrangler/`（已在 `.gitignore` 中忽略）。
+Local state is in `.wrangler/`. `.gitignore` ignores it.
 
 ---
 
-## 6. 应用生产表结构
+## 6. Apply the production schema
 
-**部署代码之前**先把 schema 应用到远程库：
+Apply the schema to the cloud database **before** you deploy the code:
 
 ```sh
 npx wrangler d1 migrations apply minimalist-web-notepad --remote
 ```
 
-- 迁移文件位于 `worker/migrations/`，按文件名顺序执行，已应用的会跳过。
-- 首次执行会创建 `notes` 表与 `idx_notes_expires_at` 索引。
-- 该命令会打印将要执行的迁移；交互终端下可能请求确认，CI/非交互环境会直接执行。
+- Migration files are in `migrations/`. They run in file-name order. Applied
+  files are skipped.
+- The first run creates the `notes` table and the `idx_notes_expires_at` index.
+- The command shows the migrations it will run. It may ask you to confirm. In
+  CI it runs without a prompt.
 
-> 代码与数据兼容：新增字段或改变默认编码时，读取端仍能解析旧行
-> （当前 `decompress` 同时支持 `zstd` / `gzip` / `identity`），因此无需回填。
+> Code and data stay compatible. The reader knows `zstd`, `gzip`, and
+> `identity`. So you can add fields or change the default codec without
+> backfilling old rows.
 
 ---
 
-## 7. 部署
+## 7. Deploy
 
 ```sh
-cd worker
-npm run deploy        # 等价于 npx wrangler deploy
+npm run deploy        # same as: npx wrangler deploy
 ```
 
-部署成功后会输出 Worker 的 URL：
+After the deploy, Wrangler prints the Worker URL:
 
-- 默认：`https://minimalist-web-notepad.<你的子域>.workers.dev`
-- 建议部署后立即用第 9 节清单做一次冒烟测试。
+- Default: `https://minimalist-web-notepad.<your-subdomain>.workers.dev`
+- Run the smoke test in section 9 right after the deploy.
 
-部署包含：
+The deploy includes:
 
-- `src/index.js` 打包上传；
-- `public/` 作为静态资源（favicon）；
-- `[[d1_databases]]` 绑定 `env.DB`；
-- `[triggers]` 注册 Cron；
-- `[vars]` 注入 `NOTE_TTL_DAYS`。
+- `src/index.js`
+- `public/` as static files (the favicon)
+- the `[[d1_databases]]` binding `env.DB`
+- the `[triggers]` Cron
+- the `[vars]` value `NOTE_TTL_DAYS`
 
-查看实时日志：
+Show live logs:
 
 ```sh
 npx wrangler tail
@@ -182,23 +185,22 @@ npx wrangler tail
 
 ---
 
-## 8. CI / 非交互部署
+## 8. CI / deploy without a browser
 
-设置环境变量后即可在流水线中部署：
+Set these environment variables, then deploy from a pipeline:
 
-| 变量 | 说明 |
+| Variable | Meaning |
 | --- | --- |
-| `CLOUDFLARE_API_TOKEN` | 具有 Workers Scripts:Edit、D1:Edit 权限的 Token |
-| `CLOUDFLARE_ACCOUNT_ID` | 账号 ID（Dashboard 右侧可查） |
+| `CLOUDFLARE_API_TOKEN` | A token with Workers Scripts:Edit and D1:Edit permission. |
+| `CLOUDFLARE_ACCOUNT_ID` | Your account ID. Find it on the right side of the dashboard. |
 
 ```sh
-cd worker
 npm ci
 npx wrangler d1 migrations apply minimalist-web-notepad --remote
 npx wrangler deploy
 ```
 
-如需密钥（例如将来启用密码功能时），用 `wrangler secret`：
+If you need a secret later (for example, for passwords), use:
 
 ```sh
 npx wrangler secret put SOME_SECRET
@@ -206,15 +208,15 @@ npx wrangler secret put SOME_SECRET
 
 ---
 
-## 9. 部署后验证清单
+## 9. Check the deploy
 
 ```sh
-BASE=https://<你的-worker-域名>
+BASE=https://<your-worker-domain>
 
-# 1. 根路径重定向
+# 1. Root redirect.
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "$BASE/"
 
-# 2. 写入 / 读取 / 模式
+# 2. Write, read, and output.
 echo hello | curl --data-binary @- "$BASE/smoke"
 curl "$BASE/smoke"          # hello
 curl "$BASE/smoke.txt"      # hello
@@ -222,61 +224,67 @@ curl "$BASE/smoke.base64"   # aGVsbG8=
 curl -s -o /dev/null -w '%{http_code}\n' "$BASE/index.jsp"   # 400
 curl -s -o /dev/null -w '%{content_type}\n' "$BASE/smoke/json"   # application/json
 
-# 3. 表单保存（模拟网页自动保存）
+# 3. Form save (the web autosave uses this).
 curl -s -d 'text=from+form' "$BASE/smoke"
 curl "$BASE/smoke"          # from form
 
-# 4. 表单空值删除
+# 4. An empty form save deletes the note.
 curl -s -d 'text=' "$BASE/smoke"
 curl -s -o /dev/null -w '%{http_code}\n' "$BASE/smoke/plain"     # 302 -> /smoke
 
-# 5. 静态资源
+# 5. Static file.
 curl -s -o /dev/null -w '%{http_code}\n' "$BASE/favicon.ico"     # 200
 
-# 6. 确认库内编码为 zstd、有过期时间
+# 6. Check the stored encoding and expiry.
 npx wrangler d1 execute minimalist-web-notepad --remote \
   --command "SELECT id, content_encoding, size_raw, size_stored, expires_at FROM notes LIMIT 5"
 ```
 
-浏览器侧：打开首页应重定向到随机 ID，输入内容约 60 秒后自动保存（也可点
-工具栏的保存按钮立即保存），刷新后仍在。
+In a browser: the home page redirects to a random ID. Type some text. The note
+saves after about 60 seconds. You can also click the Save button. Reload the
+page. The note is still there.
 
 ---
 
-## 10. 配置项
+## 10. Settings
 
-全部集中在 `worker/wrangler.toml`：
+All settings are in `wrangler.toml`:
 
-| 配置 | 位置 | 说明 |
+| Setting | Where | Meaning |
 | --- | --- | --- |
-| `NOTE_TTL_DAYS` | `[vars]` | CLI / 无 `expires` 字段时的默认有效期（天），默认 `30`；设为 `0` 表示永不过期。网页端以每篇笔记选择的过期时间为准 |
-| `crons` | `[triggers]` | GC 频率，默认 `["0 3 * * *"]`（每天 03:00 UTC） |
-| `compatibility_flags` | 顶层 | 需保留 `nodejs_compat`（zstd 依赖 `node:zlib`） |
-| `compatibility_date` | 顶层 | 需 ≥ `2024-09-23` 才能启用 `nodejs_compat` v2 |
-| `database_id` | `[[d1_databases]]` | 第 4 步创建后填入 |
+| `NOTE_TTL_DAYS` | `[vars]` | Default life (in days) for CLI saves and saves without an `expires` value. Default `30`. Set `0` to never expire. The web page uses the expiry you pick for each note. |
+| `crons` | `[triggers]` | GC schedule. Default `["0 3 * * *"]` (03:00 UTC every day). |
+| `compatibility_flags` | top level | Keep `nodejs_compat`. zstd needs `node:zlib`. |
+| `compatibility_date` | top level | Must be `2024-09-23` or newer for `nodejs_compat` v2. |
+| `database_id` | `[[d1_databases]]` | Fill this in after step 4. |
 
-修改后重新 `npm run deploy` 生效。注意：修改 `crons` 后需部署一次，
-Cloudflare 才会更新触发器。
+Run `npm run deploy` to apply changes. Note: after you change `crons`, you must
+deploy once so Cloudflare updates the trigger.
 
-### 垃圾回收
+### Garbage collection
 
-- 自动：Cron Trigger 每天调用 `scheduled`，删除 `expires_at < now` 的行。
-- 手动：`npm run db:gc`（对远程库执行一次 DELETE）。
-- 惰性：读取到已过期行时，Worker 用 `ctx.waitUntil` 立即删除并当作不存在。
+- Automatic: the Cron Trigger calls `scheduled` every day. It deletes rows
+  where `expires_at < now`.
+- Manual: `npm run db:gc` runs one DELETE on the cloud database.
+- Lazy: when a read finds an expired row, the Worker deletes it with
+  `ctx.waitUntil` and treats it as missing.
 
-### 过期策略说明
+### How expiry works
 
-网页端在底部状态栏选择过期时间（`24h` / `72h` / `1w` / `never`），保存时随
-`expires` 字段提交，每次写入都会按该值刷新 `expires_at`，即“闲置即过期”。
-CLI 写入不带该字段时回退为 `NOTE_TTL_DAYS`。若希望“创建后固定过期”，可在
-迁移中调整或修改 `saveNote` 逻辑。
+The user picks an expiry in the status bar: `24h`, `72h`, `1w`, or `never`. The
+page sends it in the `expires` field. Each save sets
+`expires_at = now + the choice`. So a note expires after a period with no
+saves. A CLI save has no `expires` field, so it uses `NOTE_TTL_DAYS`. If you
+want a fixed expiry from the creation time, change the migration or the
+`saveNote` code.
 
 ---
 
-## 11. 自定义域名 / 路由
+## 11. Custom domain / routes
 
-Dashboard → Workers & Pages → 选择 `minimalist-web-notepad` → Settings →
-Domains & Routes，添加自定义域名。也可在 `wrangler.toml` 声明：
+In the dashboard: Workers & Pages → choose `minimalist-web-notepad` →
+Settings → Domains & Routes → add a custom domain. You can also set it in
+`wrangler.toml`:
 
 ```toml
 routes = [
@@ -284,79 +292,85 @@ routes = [
 ]
 ```
 
-应用使用根路径（`/<id>`、`/favicon.ico`），因此建议绑定**独立子域**，而不是
-挂在某个网站的二级目录下；若必须放在子路径，需要反代重写路径或用
-`<base href>` 方案。
+The app uses root paths (`/<id>`, `/favicon.ico`). Use a separate subdomain. Do
+not put it under a sub-path of another site. If you must use a sub-path, you
+need a reverse proxy that rewrites the path, or a `<base href>` solution.
 
 ---
 
-## 12. 灰度与回滚
+## 12. Canary and rollback
 
 ```sh
-# 查看历史部署
+# List past deploys.
 npx wrangler deployments list
 
-# 查看当前状态
+# Show the current state.
 npx wrangler deployments status
 
-# 回滚到上一个版本
+# Roll back to the previous version.
 npx wrangler rollback --message "revert bad deploy"
 ```
 
-重要：**回滚只回滚 Worker 代码，不会回滚 D1 数据。** 由于读取端兼容
-`zstd` / `gzip` / `identity`，代码在不同编码版本间回滚是安全的；但删除数据的
-操作不可逆，回滚前请确认。
+Important: **A rollback changes the Worker code only. It does not change D1
+data.** The reader knows `zstd`, `gzip`, and `identity`. So a code rollback
+between codecs is safe. But a delete is permanent. Check before you roll back.
 
 ---
 
-## 13. 常见问题排查
+## 13. Common problems
 
-**`database_id` 仍是占位符 / binding 报错**
-未替换 `wrangler.toml` 里的 `REPLACE_WITH_YOUR_DATABASE_ID`。执行
-`npx wrangler d1 list` 找到真实 ID 后填入。
+**`database_id` is still the placeholder / binding error**
+You did not replace `REPLACE_WITH_YOUR_DATABASE_ID` in `wrangler.toml`. Run
+`npx wrangler d1 list` to find the real ID, then fill it in.
 
-**本地能跑、线上报 no such table: notes**
-远程库还没应用迁移。运行
-`npx wrangler d1 migrations apply minimalist-web-notepad --remote`。
+**It works locally but the cloud says "no such table: notes"**
+The cloud database has no schema yet. Run
+`npx wrangler d1 migrations apply minimalist-web-notepad --remote`.
 
 **`zstdCompressSync is not a function`**
-缺少 `nodejs_compat` 兼容标志，或 `compatibility_date` 过旧。确认
-`wrangler.toml` 含 `compatibility_flags = ["nodejs_compat"]` 且日期
-≥ `2024-09-23`，然后重新部署。
+The `nodejs_compat` flag is missing, or `compatibility_date` is too old. Check
+that `wrangler.toml` has `compatibility_flags = ["nodejs_compat"]` and a date
+of `2024-09-23` or newer. Then deploy again.
 
-**zstd / node:zlib 相关的构建或体积告警**
-`nodejs_compat` 会注入 polyfill，bundle 略增大；本 Worker 约 15 KiB
-（gzip 后约 5 KiB），可忽略。
+**Build or size warning about zstd / node:zlib**
+`nodejs_compat` adds polyfills, so the bundle is a bit bigger. This Worker is
+about 15 KiB (about 5 KiB gzip). You can ignore the warning.
 
-**`wrangler dev` 无法启动 / workerd 下载失败**
-多为网络/代理问题。确认能访问 `*.workers.dev` 与 npm registry；必要时
-配置代理后重试，或升级 wrangler。
+**`wrangler dev` does not start / workerd download fails**
+This is usually a network or proxy problem. Check that you can reach
+`*.workers.dev` and the npm registry. Set a proxy if needed, or update
+wrangler.
 
-**迁移显示 “No migrations to apply!” 但表不存在**
-可能用了 `--local` 而目标是远程（或反之）。本地用 `--local`，线上用
-`--remote`，两者数据独立。
+**"No migrations to apply!" but the table is missing**
+You may have used `--local` but you want the cloud database (or the opposite).
+Use `--local` for your computer. Use `--remote` for the cloud. The data is
+separate.
 
-**Cron 没有触发 GC**
-确认已部署且 `[triggers] crons` 非空；在 Dashboard 的 Worker → Triggers
-可查看。也可先手动 `npm run db:gc` 验证 SQL。
+**The Cron does not run GC**
+Check that you deployed and that `[triggers] crons` is not empty. In the
+dashboard, open Worker → Triggers. You can also run `npm run db:gc` to test the
+SQL by hand.
 
-**大文本或高并发下的限制**
-Workers 有 CPU 时间上限、D1 有单库容量与查询限制。当前实现使用同步 zstd，
-超大笔记会占用 CPU；如遇到可改为异步/流式压缩，或对超长内容降级为
-`identity` 存储。
+**Limits for large text or high traffic**
+Workers have a CPU time limit. D1 has database size and query limits. This
+Worker uses synchronous zstd. A very large note uses CPU. If you hit a limit,
+use async or streaming compression, or store very large notes as `identity`.
 
 **favicon 404**
-确认 `worker/public/favicon.ico` 存在且 `wrangler.toml` 的 `[assets]` 指向
-`./public`；静态资源与 Worker 路由共存时，未匹配到文件才会进入 Worker。
+Check that `public/favicon.ico` exists and that `[assets]` in `wrangler.toml`
+points to `./public`. Static files and Worker routes share the domain. Only
+requests that do not match a file go to the Worker.
 
 ---
 
-## 14. 安全与合规
+## 14. Security and privacy
 
-- 所有响应带 `Cache-Control: no-store` 与 `X-Robots-Tag: noindex, nofollow`。
-- 原 PHP 版的 Apache Basic Auth 在 Workers 上不适用；如需访问控制，可用
-  Cloudflare Access 或 Worker 内的鉴权逻辑。
-- 密码查看功能尚未启用，但表结构已预留 `password_*` 字段；后续建议用
-  PBKDF2（`crypto.subtle`）存哈希，并结合 `is_protected` 控制读取。
-- 笔记 ID 为 5 位随机字符（约 1700 万组合），与上游一致，**不是**强访问控制，
-  敏感内容请勿依赖 ID 保密性。
+- Every response has `Cache-Control: no-store` and
+  `X-Robots-Tag: noindex, nofollow`.
+- The original PHP app used Apache Basic Auth. That does not work on Workers.
+  For access control, use Cloudflare Access or add auth code to the Worker.
+- Password view is not enabled yet. The table has the `password_*` columns. A
+  future version should hash with PBKDF2 (`crypto.subtle`) and use
+  `is_protected` to control reads.
+- A note ID is 5 random characters (about 17 million combinations). This is
+  **not** strong access control. Do not rely on the ID to hide secret content.

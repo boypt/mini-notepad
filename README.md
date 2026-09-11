@@ -1,116 +1,136 @@
-# Minimalist Web Notepad — Cloudflare Workers + D1
+# Minimalist Web Notepad (Cloudflare Workers + D1)
 
-A port of the single-file PHP app in the repository root (`index.php`) to a
-[Cloudflare Worker](https://developers.cloudflare.com/workers/) backed by
-[D1](https://developers.cloudflare.com/d1/). Same URLs and output modes, now
-with a 60-second autosave UI and a per-note expiry control — but serverless and
-durable.
+A small web notepad. It runs on [Cloudflare Workers](https://developers.cloudflare.com/workers/).
+It stores notes in a [D1](https://developers.cloudflare.com/d1/) database.
 
-## What changed vs. the PHP version
+## Features
 
-| Concern | PHP app | Worker app |
-| --- | --- | --- |
-| Storage | flat files in `_tmp/` | D1 table `notes` |
-| Body storage | raw bytes on disk | **zstd BLOB; plain UTF-8 when < 128 bytes** |
-| Expiry / GC | none | `expires_at` column + daily Cron Trigger |
-| Password | none | reserved `password_*` columns (not enforced yet) |
-| Routing | `.htaccess` rewrite | Worker `fetch` handler |
+- Type in the page. The note saves by itself every 60 seconds.
+- Click **Save** to save at once. This button is disabled until you change the
+  text. When it is disabled, it looks grey.
+- Click **New** to open a note. A box asks you for a note ID.
+- The output menu shows a note as plain text or as Base64.
+- The status bar shows the last save time and the expiry time.
+- You can pick when a note expires: 24 hours, 72 hours, 1 week, or never.
 
-## Layout
+## Routes
 
-```
-worker/
-├── src/index.js              # Worker: router, D1 store, compression, modes
-├── migrations/0001_init.sql  # D1 schema
-├── public/favicon.ico        # served as a static asset
-├── wrangler.toml             # bindings, cron, vars
-└── package.json              # wrangler dev/deploy scripts
-```
+| Route | What it does |
+| --- | --- |
+| `GET /` | Sends a `302` redirect to a new random note ID. |
+| `GET /:note` | Shows the HTML editor. |
+| `GET /:note.txt` | Shows the note as plain text. |
+| `GET /:note.base64` | Shows the note as Base64. |
+| `GET /:note/:mode` | Old route. It still works. |
+| `POST /:note` (form field `text`) | Saves the note. An empty `text` deletes it. |
+| `POST /:note` (raw body) | CLI save. |
+| `POST /:note/append` (raw body) | CLI append. |
 
-## Behaviour (identical to the PHP app)
+Notes:
 
-- `GET /` → `302` to a random 5-char note id (`234579abcdefghjkmnpqrstwxyz`).
-- `GET /:note` → HTML editor; autosaves via `POST` every 60s. The toolbar has
-  New / Save buttons and an output `<select>`; the status bar shows the last
-  saved time and a per-note expiry `<select>`.
-- `GET /:note.txt` → stored note as plain text.
-- `GET /:note.base64` → stored note as base64.
-- Any other file suffix (e.g. `/index.jsp`, `/note.html`) → `400`.
-- `GET /:note/:mode` → legacy mode route, still accepted:
-  `plain`, `base64`, `mtime`, `html`, `css`, `js`, `json`. Unknown modes fall
-  back to raw text.
-- `POST /:note` with a `text` form field → save (empty `text` **deletes**);
-  responds with JSON `{ created_at, updated_at, expires_at }`. An optional
-  `expires` field (`24h`, `72h`, `1w`, `never`) sets the note's expiry.
-- `POST /:note` with a raw body → CLI save.
-- `POST /:note/append` with a raw body → CLI append.
-- Any `curl` user-agent → raw stored body, no HTML wrapper.
-- All responses are `no-store` and `X-Robots-Tag: noindex, nofollow`.
+- A note ID uses only these characters: `a-z`, `A-Z`, `0-9`, `_`, and `-`.
+- A file suffix we do not know (for example `/index.jsp`) returns `400`.
+- A `curl` user agent gets the raw note body. It does not get HTML.
+- All responses use `no-store` and `X-Robots-Tag: noindex, nofollow`.
 
-## Compression
+## Output modes
 
-Note bodies shorter than 128 bytes are stored as plain UTF-8
-(`content_encoding = 'identity'`); larger bodies are zstd-compressed via
-`node:zlib` and stored as a BLOB (`content_encoding = 'zstd'`). `size_raw` /
-`size_stored` record both sizes for visibility. Reads transparently decode;
-`gzip` and `identity` are also understood so data written by an earlier build
-stays readable.
+The output menu opens a file name:
 
-Why `node:zlib` instead of the Web `CompressionStream` API? The Web API only
-implements `gzip` / `deflate` / `deflate-raw` in Workers — `zstd` (and
-`brotli`) are unavailable there. `node:zlib` provides zstd, which requires
-the `nodejs_compat` compatibility flag already set in `wrangler.toml`.
+- `/<id>.txt` gives plain text.
+- `/<id>.base64` gives Base64.
+
+The old `/<id>/<mode>` route still works. It supports `plain`, `base64`,
+`mtime`, `html`, `css`, `js`, and `json`. An unknown mode gives raw text.
+
+## Storage and compression
+
+- A note shorter than 128 bytes is saved as plain UTF-8 text.
+  `content_encoding` is `identity`.
+- A longer note is compressed with zstd and saved as a BLOB.
+  `content_encoding` is `zstd`.
+- The table stores `size_raw` and `size_stored`.
+- On read, the code can decode `zstd`, `gzip`, and `identity`. So old notes
+  still work.
+
+Why `node:zlib`? In Workers, the Web `CompressionStream` API supports only
+`gzip`, `deflate`, and `deflate-raw`. It does not support zstd or brotli.
+`node:zlib` gives us zstd. It needs the `nodejs_compat` flag. That flag is
+already in `wrangler.toml`.
 
 ## Expiry and garbage collection
 
-- The web editor sends an `expires` token (`24h`, `72h`, `1w`, `never`); the
-  Worker sets `expires_at = now + token` accordingly. Writes without a token
-  (CLI) fall back to `expires_at = now + NOTE_TTL_DAYS` (default `30`, set
-  `NOTE_TTL_DAYS = "0"` to disable). `created_at` is set once, `updated_at`
-  on every write.
-- A Cron Trigger (`0 3 * * *`) runs the `scheduled` handler, which deletes
-  rows whose `expires_at` is in the past.
-- Reads also lazily delete an expired row via `ctx.waitUntil`.
+- The web editor sends an `expires` value: `24h`, `72h`, `1w`, or `never`.
+- The Worker sets `expires_at = now + expires`.
+- A CLI save has no `expires` value. Then the Worker uses `NOTE_TTL_DAYS`
+  (default `30`). Set `NOTE_TTL_DAYS = "0"` to never expire.
+- `created_at` is set one time. `updated_at` changes on every save.
+- A Cron Trigger runs at `0 3 * * *` (03:00 UTC every day). It deletes notes
+  that are past `expires_at`.
+- A read also deletes an expired note. It uses `ctx.waitUntil`.
 
-## Reserved password structure
+## Save response
 
-The schema already carries `is_protected`, `password_hash`, `password_salt`
-and `password_algo`. The current Worker always writes `is_protected = 0` and
-does not enforce anything. A future change can add the hash check (suggested:
-PBKDF2 via `crypto.subtle.deriveBits`, storing `password_algo =
-"pbkdf2-sha256"`).
+A form save returns JSON:
+
+```json
+{ "created_at": 0, "updated_at": 0, "expires_at": 0 }
+```
+
+`expires_at` can be `null`. A delete returns `{ "deleted": true }`.
+
+## Password columns (not used yet)
+
+The `notes` table has `is_protected`, `password_hash`, `password_salt`, and
+`password_algo`. The Worker writes `is_protected = 0` and does not check a
+password. A future version can add the check. PBKDF2 with `crypto.subtle` is a
+good choice. Store `password_algo = "pbkdf2-sha256"`.
+
+## Files
+
+```
+src/index.js              # router, D1 store, compression, HTML page
+migrations/0001_init.sql  # D1 schema
+public/favicon.ico        # static asset
+wrangler.toml             # bindings, cron, vars
+package.json              # dev and deploy scripts
+README.md                 # this file
+DEPLOY.md                 # deployment guide
+```
 
 ## Setup
 
-> Full production deployment guide: [DEPLOY.md](./DEPLOY.md).
+See [DEPLOY.md](./DEPLOY.md) for the full production steps.
 
 ```sh
-cd worker
 npm install
 
-# 1. Create the D1 database and copy the printed database_id into wrangler.toml
+# 1. Create the D1 database. Copy the printed database_id into wrangler.toml.
 npx wrangler d1 create minimalist-web-notepad
 
-# 2. Apply the schema (use --local for local dev)
+# 2. Apply the schema. Use --local for local dev.
 npx wrangler d1 migrations apply minimalist-web-notepad --remote
 
-# 3. Run locally or deploy
+# 3. Run local, or deploy.
 npx wrangler dev
 npx wrangler deploy
 ```
 
-Manual smoke test (mirrors the PHP checklist):
+## Smoke test
 
 ```sh
-curl -s https://<your-worker>/cli-test/plain          # empty
-echo hello | curl --data-binary @- https://<your-worker>/cli-test
-curl https://<your-worker>/cli-test                    # hello (curl UA → raw)
-echo " world" | curl --data-binary @- https://<your-worker>/cli-test/append
-curl https://<your-worker>/cli-test                    # hello world
+BASE=http://127.0.0.1:8787
+
+curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "$BASE/"
+echo hello | curl --data-binary @- "$BASE/cli-test"
+curl "$BASE/cli-test"            # hello
+curl "$BASE/cli-test.txt"        # hello
+curl "$BASE/cli-test.base64"     # aGVsbG8=
+echo " world" | curl --data-binary @- "$BASE/cli-test/append"
+curl "$BASE/cli-test"            # hello world
 ```
 
-## Scope note
+## Note
 
-`package.json`, `wrangler.toml` and `migrations/` are new files required by
-the Cloudflare Workers toolchain. The PHP app in the repository root is
-untouched and still runs as before.
+This repository holds the Worker version of the app. It is a port of the
+original single-file PHP notepad.
