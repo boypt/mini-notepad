@@ -27,8 +27,9 @@
  *     (content_encoding = 'identity').
  *   - Every row carries created_at / updated_at / expires_at; a Cron
  *     Trigger garbage-collects expired rows. Reads also lazily delete.
- *   - The web editor offers a per-note expiry choice; CLI writes fall back
- *     to NOTE_TTL_DAYS.
+ *   - The web editor offers a per-note expiry choice; a CLI write that sends
+ *     no choice keeps the note's existing expiry (NOTE_TTL_DAYS is only the
+ *     default for a brand-new note).
  *   - Password columns (password_hash / password_salt / password_algo /
  *     is_protected) are reserved for a future password-protected view.
  *     They are stored but not yet enforced.
@@ -161,7 +162,8 @@ export function encodeForStorage(text) {
 
 /**
  * Map a web-UI expiry token to an `expires` argument for saveNote.
- * `undefined` means "use NOTE_TTL_DAYS"; `null` means "never expires".
+ * `undefined` means "no choice" (saveNote keeps the note's current expiry, or
+ * uses NOTE_TTL_DAYS for a new note); `null` means "never expires".
  */
 export function resolveExpiryToken(token) {
   if (token == null || token === '') return undefined;
@@ -259,30 +261,45 @@ async function loadNote(env, id) {
 
 /**
  * Insert or update a note. Short bodies are stored as plain UTF-8; larger ones
- * are zstd-compressed. expires_at is (re)computed on every write:
- *   - `expires` as a number  -> now + that many ms
- *   - `expires === null`     -> never expires
- *   - `expires` undefined    -> NOTE_TTL_DAYS default (0 = never expires)
+ * are zstd-compressed. expires_at rules:
+ *   - `expires` as a number  -> now + that many ms (an explicit choice wins)
+ *   - `expires === null`     -> never expires (an explicit "never" wins)
+ *   - `expires` undefined    -> keep the note's current expiry; a new note
+ *                               falls back to NOTE_TTL_DAYS (0 = never expires)
  */
 async function saveNote(env, id, text, { append = false, expires } = {}) {
   const now = Date.now();
+
+  // Only read the old row when it is needed: to append, or to inherit an expiry
+  // the user set earlier (a manual choice beats the default).
+  let savedExpires; // undefined = no existing row / not loaded
+  let base = '';
+  if (append) {
+    const existing = await loadNote(env, id);
+    if (existing && !existing.expired) {
+      base = existing.text;
+      savedExpires = existing.row.expires_at ?? null;
+    }
+  } else if (expires === undefined) {
+    const row = await env.DB.prepare(
+      'SELECT expires_at FROM notes WHERE id = ? LIMIT 1',
+    ).bind(id).first();
+    if (row) savedExpires = row.expires_at ?? null;
+  }
 
   let expiresAt;
   if (expires === null) {
     expiresAt = null;
   } else if (typeof expires === 'number') {
     expiresAt = now + expires;
+  } else if (savedExpires !== undefined) {
+    expiresAt = savedExpires;
   } else {
     const ttlDays = Number(env.NOTE_TTL_DAYS ?? DEFAULT_TTL_DAYS);
     expiresAt = ttlDays > 0 ? now + ttlDays * DAY_MS : null;
   }
 
-  let body = text;
-  if (append) {
-    const existing = await loadNote(env, id);
-    const base = existing && !existing.expired ? existing.text : '';
-    body = base + text;
-  }
+  const body = append ? base + text : text;
 
   const { bytes, encoding, rawSize } = encodeForStorage(body);
 

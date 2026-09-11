@@ -258,7 +258,7 @@ All settings are in `wrangler.toml`:
 
 | Setting | Where | Meaning |
 | --- | --- | --- |
-| `NOTE_TTL_DAYS` | `[vars]` | Default life (in days) for CLI saves and saves without an `expires` value. Default `30`. Set `0` to never expire. The web page uses the expiry you pick for each note. |
+| `NOTE_TTL_DAYS` | `[vars]` | Default life (in days) for a new note and for saves without an `expires` value. Default `30`. Set `0` to never expire. An existing note keeps the expiry you set before; the web page uses the expiry you pick. |
 | `crons` | `[triggers]` | GC schedule. Default `["0 3 * * *"]` (03:00 UTC every day). |
 | `compatibility_flags` | top level | Keep `nodejs_compat`. zstd needs `node:zlib`. |
 | `compatibility_date` | top level | Must be `2024-09-23` or newer for `nodejs_compat` v2. |
@@ -280,9 +280,9 @@ deploy once so Cloudflare updates the trigger.
 The user picks an expiry in the status bar: `24h`, `72h`, `1w`, or `never`. The
 page sends it in the `expires` field. Each save sets
 `expires_at = now + the choice`. So a note expires after a period with no
-saves. A CLI save has no `expires` field, so it uses `NOTE_TTL_DAYS`. If you
-want a fixed expiry from the creation time, change the migration or the
-`saveNote` code.
+saves. A CLI save has no `expires` field, so it keeps the note's current
+expiry. A new note uses `NOTE_TTL_DAYS`. If you want a fixed expiry from the
+creation time, change the migration or the `saveNote` code.
 
 ---
 

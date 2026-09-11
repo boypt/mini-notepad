@@ -128,8 +128,9 @@ already in `wrangler.toml`.
 
 - The web editor sends an `expires` value: `24h`, `72h`, `1w`, or `never`.
 - The Worker sets `expires_at = now + expires`.
-- A CLI save has no `expires` value. Then the Worker uses `NOTE_TTL_DAYS`
-  (default `30`). Set `NOTE_TTL_DAYS = "0"` to never expire.
+- A CLI save has no `expires` value. Then the Worker keeps the note's current
+  expiry. A new note starts with `NOTE_TTL_DAYS` (default `30`). Set
+  `NOTE_TTL_DAYS = "0"` to never expire.
 - `created_at` is set one time. `updated_at` changes on every save.
 - A Cron Trigger runs at `0 3 * * *` (03:00 UTC every day). It deletes notes
   that are past `expires_at`.
