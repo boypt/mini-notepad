@@ -5,13 +5,11 @@ It stores notes in a [D1](https://developers.cloudflare.com/d1/) database.
 
 ## Features
 
-- Type in the page. The note saves by itself every 60 seconds.
-- Click **Save** to save at once. This button is disabled until you change the
-  text. When it is disabled, it looks grey.
-- Click **New** to open a note. A box asks you for a note ID.
-- The output menu shows a note as plain text or as Base64.
-- The status bar shows the last save time and the expiry time.
-- You can pick when a note expires: 24 hours, 72 hours, 1 week, or never.
+- Simple text editing in the browser.
+- Output as plain text or Base64.
+- Command-line read, write, and append (see
+  [Command line](#command-line)).
+- Made for IT maintenance and programmers who need to share text quickly.
 
 ## Routes
 
@@ -38,6 +36,37 @@ The output menu opens a file name:
 
 - `/<id>.txt` gives plain text.
 - `/<id>.base64` gives Base64.
+
+## Command line
+
+The Worker speaks plain HTTP, so you can use `curl` or any HTTP client.
+
+Save a note with a raw body:
+
+```sh
+echo "hello" | curl --data-binary @- https://<your-worker>/my-note
+```
+
+Read it back:
+
+```sh
+curl https://<your-worker>/my-note
+```
+
+Append to it:
+
+```sh
+echo " world" | curl --data-binary @- https://<your-worker>/my-note/append
+```
+
+Read plain text or Base64:
+
+```sh
+curl https://<your-worker>/my-note.txt
+curl https://<your-worker>/my-note.base64
+```
+
+A `curl` user agent gets the raw note text, not the HTML page.
 
 ## Storage and compression
 
