@@ -950,6 +950,13 @@ select:disabled {
     cursor: not-allowed;
     opacity: 0.6;
 }
+/* Keep every toolbar control on the same 28px baseline as button.icon and
+   #font-size. Scoped to .toolbar so the status bar select is untouched. */
+.toolbar select {
+    height: 28px;
+    padding-top: 0;
+    padding-bottom: 0;
+}
 #lock-note {
     font: inherit;
     font-size: 12px;
