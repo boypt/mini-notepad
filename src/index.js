@@ -5,13 +5,17 @@
  *
  * Routes:
  *   - GET  /                     -> 302 redirect to a random 5-char note id
- *   - GET  /:note                -> HTML editor
+ *   - GET  /:note                -> HTML editor shell (empty body + meta/csrf);
+ *                                    the body is then fetched by XHR
+ *                                    GET /:note.txt
  *   - GET  /:note.txt            -> stored note as plain text
  *   - GET  /:note.base64         -> stored note as base64
  *   - GET  /:note/:mode          -> stored note in that mode (legacy; plain,
  *                                    base64, mtime, html, css, js, json;
  *                                    unknown == raw)
  *   - unknown file suffix        -> 400
+ *   - XHR GET missing .txt       -> 404 plain text (no redirect, so the
+ *                                    loader can tell a new note apart)
  *   - POST /:note  (form `text`) -> save; empty `text` deletes
  *   - POST /:note/expire (form `expires`) -> change expiry, keep the body
  *   - POST /:note  (raw body)    -> CLI save
@@ -22,6 +26,10 @@
  * Security:
  *   - A browser form save must carry the per-note CSRF token from the page.
  *   - A raw CLI write is allowed only for whitelisted user agents (curl, wget).
+ *   - GET /:note returns only the empty shell (meta/csrf, no body text);
+ *     the body is loaded via XHR GET /:note.txt. An XHR for a missing
+ *     note gets 404; a direct navigation to a missing .txt redirects
+ *     back to the editor.
  *
  * Storage:
  *   - Bodies are zstd-compressed (node:zlib) before they are written to D1;
@@ -259,6 +267,24 @@ async function loadNote(env, id) {
     text = decompress(bytes, row.content_encoding || CODEC);
   }
   return { expired: false, row, text };
+}
+
+/**
+ * Load only a note's metadata (no body BLOB, no decompression) for the HTML
+ * shell. Returns null when missing, or { expired: true, row } when past
+ * expires_at (the caller schedules the delete and treats it as null),
+ * matching loadNote's expiry semantics.
+ */
+async function loadNoteMeta(env, id) {
+  const row = await env.DB.prepare(
+    `SELECT id, created_at, updated_at, expires_at, is_protected
+       FROM notes WHERE id = ? LIMIT 1`,
+  ).bind(id).first();
+
+  if (!row) return null;
+  if (row.expires_at != null && row.expires_at < Date.now()) return { expired: true, row };
+
+  return { expired: false, row };
 }
 
 /**
@@ -512,34 +538,52 @@ function modeResponse(loaded, mode) {
 }
 
 async function handleGet(request, env, ctx, id, mode) {
-  let loaded = await loadNote(env, id);
-  if (loaded && loaded.expired) {
-    ctx.waitUntil(deleteNote(env, id));
-    loaded = null;
-  }
-
   if (mode) {
-    if (!loaded) return redirect('/' + id);
+    let loaded = await loadNote(env, id);
+    if (loaded && loaded.expired) {
+      ctx.waitUntil(deleteNote(env, id));
+      loaded = null;
+    }
+
+    if (!loaded) {
+      // XHR content loads need a 404 to tell "new note" apart; a direct
+      // navigation to a missing .txt goes back to the editor instead.
+      if (request.headers.get('X-Requested-With') === 'XMLHttpRequest') return notFound();
+      return redirect('/' + id);
+    }
     return modeResponse(loaded, mode);
   }
 
   const userAgent = request.headers.get('user-agent') || '';
   if (isCliUserAgent(userAgent)) {
+    let loaded = await loadNote(env, id);
+    if (loaded && loaded.expired) {
+      ctx.waitUntil(deleteNote(env, id));
+      loaded = null;
+    }
     return new Response(loaded ? loaded.text : '', {
       status: 200,
       headers: noStore({ 'Content-Type': 'text/plain; charset=utf-8' }),
     });
   }
 
-  const meta = loaded
+  // Browser shell: metadata only, no body BLOB decompression. The body is
+  // fetched after page load via XHR GET /:note.txt.
+  let metaLoaded = await loadNoteMeta(env, id);
+  if (metaLoaded && metaLoaded.expired) {
+    ctx.waitUntil(deleteNote(env, id));
+    metaLoaded = null;
+  }
+
+  const meta = metaLoaded
     ? {
-        createdAt: loaded.row.created_at ?? null,
-        updatedAt: loaded.row.updated_at ?? null,
-        expiresAt: loaded.row.expires_at ?? null,
+        createdAt: metaLoaded.row.created_at ?? null,
+        updatedAt: metaLoaded.row.updated_at ?? null,
+        expiresAt: metaLoaded.row.expires_at ?? null,
       }
     : { createdAt: null, updatedAt: null, expiresAt: null };
   meta.csrf = csrfToken(env, id);
-  return new Response(renderPage(id, loaded ? loaded.text : '', meta), {
+  return new Response(renderPage(id, '', meta), {
     status: 200,
     headers: noStore({ 'Content-Type': 'text/html; charset=utf-8' }),
   });
@@ -837,11 +881,11 @@ main {
     <main>
         <div class="editor" id="editor">
             <div class="gutter" id="gutter" aria-hidden="true"><pre class="gutter-lines" id="gutter-lines">1</pre></div>
-            <textarea id="content" wrap="off" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-gramm="false" data-gramm_editor="false" data-enable-grammarly="false">${escapeHtml(text)}</textarea>
+            <textarea id="content" wrap="off" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-gramm="false" data-gramm_editor="false" data-enable-grammarly="false" placeholder="Loading…" disabled></textarea>
         </div>
     </main>
     <footer class="statusbar">
-        <span id="saved-at">Not saved yet</span>
+        <span id="saved-at">Loading…</span>
         <span class="grow"></span>
         <label for="expiry">Expires
             <select id="expiry" aria-label="Expiry">
@@ -887,9 +931,15 @@ main {
     var content = textarea.value;
     var saving = false;
     var dirty = false;
+    var contentLoading = true;
 
     // Make the content available to print.
     printable.appendChild(document.createTextNode(content));
+
+    function updatePrintable(value) {
+        while (printable.firstChild) printable.removeChild(printable.firstChild);
+        printable.appendChild(document.createTextNode(value));
+    }
 
     function pad(n) {
         return String(n).padStart(2, '0');
@@ -923,6 +973,10 @@ main {
     }
 
     function updateSaveState() {
+        if (contentLoading) {
+            saveButton.disabled = true;
+            return;
+        }
         saveButton.disabled = textarea.value === content;
     }
 
@@ -1089,7 +1143,73 @@ main {
             '&csrf=' + encodeURIComponent(meta.csrf || '');
     }
 
+    function unlockEditor() {
+        textarea.disabled = false;
+        textarea.placeholder = '';
+        contentLoading = false;
+        updateSaveState();
+        updateGutter();
+    }
+
+    function loadContent() {
+        var request = new XMLHttpRequest();
+        request.open('GET', '/' + NOTE_ID + '.txt', true);
+        request.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+        request.onreadystatechange = function () {
+            if (request.readyState !== 4) return;
+            var status = request.status;
+            if (status === 200) {
+                var contentType = request.getResponseHeader('Content-Type') || '';
+                if (contentType.indexOf('text/html') !== -1) {
+                    content = '';
+                    updatePrintable(textarea.value);
+                    unlockEditor();
+                    showSavedAt(meta.updatedAt);
+                    return;
+                }
+                var fetched = request.responseText;
+                if (textarea.value === '') {
+                    textarea.value = fetched;
+                }
+                content = fetched;
+                updatePrintable(textarea.value);
+                unlockEditor();
+                showSavedAt(meta.updatedAt);
+            } else if (status === 404) {
+                content = '';
+                updatePrintable(textarea.value);
+                unlockEditor();
+                showSavedAt(meta.updatedAt);
+            } else if (status === 401 || status === 403) {
+                // password-protected hook: a future password view unlocks here.
+                textarea.disabled = true;
+                textarea.placeholder = 'This note needs a password';
+                savedAtEl.textContent = 'Password required';
+                contentLoading = false;
+            } else {
+                content = '';
+                textarea.disabled = false;
+                textarea.placeholder = '';
+                contentLoading = false;
+                savedAtEl.textContent = 'Load failed — you can still edit';
+                updateSaveState();
+                updateGutter();
+            }
+        };
+        request.onerror = function () {
+            content = '';
+            textarea.disabled = false;
+            textarea.placeholder = '';
+            contentLoading = false;
+            savedAtEl.textContent = 'Load failed — you can still edit';
+            updateSaveState();
+            updateGutter();
+        };
+        request.send(null);
+    }
+
     function save(force) {
+        if (contentLoading) return;
         var temp = textarea.value;
 
         if (!force && temp === content) return;
@@ -1101,9 +1221,7 @@ main {
 
         saving = true;
 
-        // Make the content available to print.
-        printable.removeChild(printable.firstChild);
-        printable.appendChild(document.createTextNode(temp));
+        updatePrintable(temp);
 
         send(payload(temp), function () {
             saving = false;
@@ -1222,10 +1340,12 @@ main {
         }
     });
 
-    showSavedAt(meta.updatedAt);
+    savedAtEl.textContent = 'Loading…';
     pickExpiry();
-    updateSaveState();
     updateOutputState();
+    textarea.disabled = true;
+    saveButton.disabled = true;
+    loadContent();
     updateGutter();
     initFontSize();
     textarea.focus();
