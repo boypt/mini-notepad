@@ -1048,6 +1048,68 @@ main {
     display: none;
 }
 
+/* Command-line help overlay */
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    background: rgba(20, 24, 30, 0.55);
+}
+.modal-overlay[hidden] {
+    display: none;
+}
+.modal-card {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    max-width: 560px;
+    max-height: 85vh;
+    overflow: hidden;
+    background: #fff;
+    color: #222;
+    border: 1px solid #d3d8de;
+    border-radius: 10px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.28);
+}
+.modal-head {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    border-bottom: 1px solid #e6e9ed;
+}
+.modal-head h2 {
+    flex: 1 1 auto;
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+}
+.modal-hint {
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 10px 14px 0;
+    font-size: 12px;
+    color: #66707a;
+}
+#cli-help-code {
+    flex: 1 1 auto;
+    margin: 0;
+    padding: 12px 14px 16px;
+    overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: pre;
+}
+
 @media (prefers-color-scheme: dark) {
     body {
         background: #383934;
@@ -1106,11 +1168,31 @@ main {
     .statusbar {
         color: #b6b7ae;
     }
+    .modal-card {
+        background: #282923;
+        color: #f8f8f2;
+        border-color: #4a4b45;
+    }
+    .modal-head {
+        border-bottom-color: #3a3b35;
+    }
+    .modal-hint {
+        color: #b6b7ae;
+    }
 }
 
 @media (max-width: 560px) {
     .gutter {
         display: none;
+    }
+    .modal-overlay {
+        padding: 10px;
+    }
+    .modal-card {
+        max-height: 90vh;
+    }
+    #cli-help-code {
+        font-size: 11px;
     }
 }
 
@@ -1122,6 +1204,7 @@ main {
     }
     .toolbar,
     .statusbar,
+    .modal-overlay,
     main {
         display: none;
     }
@@ -1154,6 +1237,7 @@ main {
             <option value=".txt">Plain text</option>
             <option value=".base64">Base64</option>
         </select>
+        <button type="button" class="icon" id="cli-help" title="Command-line help" aria-label="Command-line help">⌨</button>
     </header>
     <main>
         <div class="editor" id="editor">
@@ -1175,6 +1259,16 @@ main {
         </label>
     </footer>
     <pre id="printable"></pre>
+    <div class="modal-overlay" id="cli-help-overlay" hidden>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="cli-help-title">
+            <div class="modal-head">
+                <h2 id="cli-help-title">Command line</h2>
+                <button type="button" class="icon" id="cli-help-close" title="Close" aria-label="Close">×</button>
+            </div>
+            <p class="modal-hint">Use <code>curl</code> with this note URL. A <code>curl</code> or <code>wget</code> user agent gets the raw text.</p>
+            <pre id="cli-help-code"></pre>
+        </div>
+    </div>
     <script>
 /*! Web Notepad Workers Mod */
 (function () {
@@ -1199,6 +1293,10 @@ main {
     var copyButton = document.getElementById('copy-note');
     var pasteButton = document.getElementById('paste-note');
     var lockButton = document.getElementById('lock-note');
+    var helpButton = document.getElementById('cli-help');
+    var helpOverlay = document.getElementById('cli-help-overlay');
+    var helpClose = document.getElementById('cli-help-close');
+    var helpCode = document.getElementById('cli-help-code');
 
     var meta;
     try {
@@ -1841,6 +1939,78 @@ main {
     }
 
     if (lockButton) lockButton.addEventListener('click', onLockClick);
+
+    // Command-line help overlay. The note URL is built at runtime so the
+    // examples point at this deployment and this note ID.
+    function noteUrl() {
+        var loc = window.location;
+        var origin = loc.origin;
+        if (!origin) origin = loc.protocol + '//' + loc.host;
+        return origin + '/' + NOTE_ID;
+    }
+
+    function buildHelp() {
+        if (!helpCode) return;
+        var u = noteUrl();
+        var lines = [
+            '# save raw text (a new ID is created if the note does not exist)',
+            'echo "hello" | curl --data-binary @- ' + u,
+            '',
+            '# read the note',
+            'curl ' + u,
+            'curl ' + u + '.txt',
+            'curl ' + u + '.base64',
+            '',
+            '# append',
+            'echo " world" | curl --data-binary @- ' + u + '/append',
+            '',
+            '# change the expiry (24h, 72h, 1w, never)',
+            "curl -d 'expires=24h' " + u + '/expire',
+            "curl -d 'expires=never' " + u + '/expire',
+            '',
+            '# set, change or remove the password',
+            "curl -d 'new=secret' " + u + '/password',
+            "curl -d 'current=secret&new=new-secret' " + u + '/password',
+            "curl -d 'current=secret&new=' " + u + '/password',
+            '',
+            '# read a protected note',
+            "curl -H 'X-Note-Password: secret' " + u + '.txt',
+            'curl ' + u + '.txt?pw=secret',
+            '',
+            '# save and set a password in one step',
+            "echo hello | curl --data-binary @- -H 'X-Note-Password: secret' " + u
+        ];
+        helpCode.textContent = lines.join(String.fromCharCode(10));
+    }
+
+    function onHelpKeydown(event) {
+        var isEsc = event.key === 'Escape' || event.key === 'Esc' || event.keyCode === 27;
+        if (isEsc) {
+            event.preventDefault();
+            closeHelp();
+        }
+    }
+
+    function openHelp() {
+        if (!helpOverlay) return;
+        buildHelp();
+        helpOverlay.hidden = false;
+        document.addEventListener('keydown', onHelpKeydown, true);
+        if (helpClose) helpClose.focus();
+    }
+
+    function closeHelp() {
+        if (!helpOverlay || helpOverlay.hidden) return;
+        helpOverlay.hidden = true;
+        document.removeEventListener('keydown', onHelpKeydown, true);
+        if (helpButton) helpButton.focus();
+    }
+
+    if (helpButton) helpButton.addEventListener('click', openHelp);
+    if (helpClose) helpClose.addEventListener('click', closeHelp);
+    if (helpOverlay) helpOverlay.addEventListener('click', function (event) {
+        if (event.target === helpOverlay) closeHelp();
+    });
 
     savedAtEl.textContent = 'Loading…';
     pickExpiry();
