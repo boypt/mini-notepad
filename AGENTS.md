@@ -66,7 +66,9 @@ npm run db:gc              # one-off remote GC of expired notes
 - `is_protected` / `password_hash` / `password_salt` / `password_algo` columns
   enforce the password lock (`POST /:note/password`, PBKDF2-SHA256, 100k
   rounds). Reads take `X-Note-Password` or `?pw=`; writes take only the
-  header; a bad or missing password returns 401.
+  header; a bad or missing password returns 401. A write to an unprotected
+  note can set the password in one step (raw header or form `new`); on a
+  locked note form `new` returns 400.
 
 ## HTTP behavior
 

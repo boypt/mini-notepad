@@ -16,11 +16,13 @@
  *   - unknown file suffix        -> 400
  *   - XHR GET missing .txt       -> 404 plain text (no redirect, so the
  *                                    loader can tell a new note apart)
- *   - POST /:note  (form `text`) -> save; empty `text` deletes
+ *   - POST /:note  (form `text`) -> save; empty `text` deletes; optional
+ *                                    `new` locks an unlocked note in one step
  *   - POST /:note/expire (form `expires`) -> change expiry, keep the body
  *   - POST /:note/password (form `csrf` + `current` + `new`) -> set/change/
  *                                    cancel the password; `new` empty cancels
- *   - POST /:note  (raw body)    -> CLI save
+ *   - POST /:note  (raw body)    -> CLI save; a non-empty `X-Note-Password`
+ *                                    header locks an unlocked note in one step
  *   - POST /:note/append         -> CLI append
  *   - POST /       (CLI)         -> CLI save to a new random id; receipt shows id
  *   - CLI user-agent             -> raw body, no HTML wrapper
@@ -39,6 +41,9 @@
  *     enough); writes only take the header, never `?pw=`, so a mutated URL
  *     cannot leak into history or logs. `POST /:note/password` takes the
  *     current password from the form `current` field instead.
+ *   - One-step lock: a content write may carry a new password (raw header or
+ *     form `new`) only for an unlocked note; a locked note rejects form
+ *     `new` with 400 (use POST /:note/password) and keeps header-as-auth.
  *   - 401 means "Password required" (plain text); 403 means bad CSRF;
  *     404 means missing/expired. Passwords never appear in bodies,
  *     receipts, JSON, or logs.
@@ -56,7 +61,8 @@
  *     is_protected) enforce the password lock: PBKDF2-SHA256 (100k
  *     iterations), 16-byte salt, 32-byte derived key, all base64. Content
  *     saves never touch the password columns, so saving keeps the lock;
- *     only POST /:note/password or a full delete changes it.
+ *     only POST /:note/password, a one-step write password, or a full
+ *     delete changes it.
  *
  * The helper exports below are exported so they can be unit-tested with
  * plain Node; the Worker entrypoint is the default export.
@@ -571,6 +577,23 @@ async function checkWritePassword(env, request, id) {
   return (await verifyPassword(password, row)) ? null : passwordRequired();
 }
 
+/**
+ * Lock a note with a fresh password (new salt + hash). Only touches the
+ * password columns plus updated_at; content/expiry/created_at are left
+ * alone. The caller must have validated length and lock state. Returns the
+ * updated_at timestamp written. Never logs or returns the password itself.
+ */
+async function setNotePassword(env, id, newPw) {
+  const secret = await hashPassword(newPw);
+  const now = Date.now();
+  await env.DB.prepare(
+    `UPDATE notes SET is_protected = 1, password_hash = ?,
+                      password_salt = ?, password_algo = ?, updated_at = ?
+       WHERE id = ?`,
+  ).bind(secret.hash_b64, secret.salt_b64, secret.algo, now, id).run();
+  return now;
+}
+
 // ---------------------------------------------------------------------------
 // HTTP handlers
 // ---------------------------------------------------------------------------
@@ -624,6 +647,7 @@ async function handlePost(request, env, ctx, id, mode) {
     if (!cli && !verifyCsrf(env, id, params.get('csrf'))) return forbidden();
     const now = Date.now();
     let locked;
+    let stamp = now;
     if (updated === '') {
       await env.DB.prepare(
         `UPDATE notes SET is_protected = 0, password_hash = NULL,
@@ -632,12 +656,7 @@ async function handlePost(request, env, ctx, id, mode) {
       ).bind(now, id).run();
       locked = false;
     } else {
-      const secret = await hashPassword(updated);
-      await env.DB.prepare(
-        `UPDATE notes SET is_protected = 1, password_hash = ?,
-                          password_salt = ?, password_algo = ?, updated_at = ?
-           WHERE id = ?`,
-      ).bind(secret.hash_b64, secret.salt_b64, secret.algo, now, id).run();
+      stamp = await setNotePassword(env, id, updated);
       locked = true;
     }
     if (cli) {
@@ -650,7 +669,7 @@ async function handlePost(request, env, ctx, id, mode) {
         ].join('\n'),
       );
     }
-    return jsonOk({ protected: locked, updated_at: now });
+    return jsonOk({ protected: locked, updated_at: stamp });
   }
 
   // Write gate: a locked note needs the right `X-Note-Password` header for
@@ -678,18 +697,31 @@ async function handlePost(request, env, ctx, id, mode) {
 
   // Web (form) save path: the autosave XHR posts `text=...` (and `expires=...`).
   // A browser must send the per-note CSRF token from the page. Whitelisted CLI
-  // tools may skip it so `curl -d 'text=...'` keeps working.
+  // tools may skip it so `curl -d 'text=...'` keeps working. Optional `new`
+  // sets a password in the same write, but only on an unlocked note; on a
+  // locked note any `new` is rejected (use POST /:note/password instead).
   if (contentType.includes('application/x-www-form-urlencoded')) {
     const params = new URLSearchParams(raw);
     if (params.has('text')) {
+      const formRow = (await loadNoteMeta(env, id))?.row ?? null;
+      const formLocked = isProtectedRow(formRow);
+      if (formLocked && params.has('new')) return badRequest();
       if (!cli && !verifyCsrf(env, id, params.get('csrf'))) return forbidden();
       const text = params.get('text') ?? '';
       if (text.length === 0) {
+        // Delete ignores `new` on an unlocked note; a locked note already
+        // passed the 401 gate above and rejects any `new` with 400.
         await deleteNote(env, id);
         return cli ? cliDeleted(id) : jsonOk({ deleted: true });
       }
+      let setPw = '';
+      if (!formLocked && params.has('new')) {
+        setPw = params.get('new') ?? '';
+        if (setPw.length > PASSWORD_MAX_LENGTH) return badRequest();
+      }
       const expires = resolveExpiryToken(params.get('expires'));
       const saved = await saveNote(env, id, text, { expires });
+      if (setPw !== '') await setNotePassword(env, id, setPw);
       if (cli) return cliReceipt(url, id, 'Saved', saved.updatedAt, saved.expiresAt);
       const row = await env.DB.prepare(
         'SELECT created_at, updated_at, expires_at FROM notes WHERE id = ? LIMIT 1',
@@ -703,11 +735,21 @@ async function handlePost(request, env, ctx, id, mode) {
   }
 
   // CLI path: raw request body. Only whitelisted CLI user agents may use it.
+  // One-step lock: on an unlocked note a non-empty `X-Note-Password` header
+  // becomes the password after the content is saved (overlong -> 400, nothing
+  // saved). On a locked note the header was already consumed as auth above.
   if (!cli) return forbidden();
   const append = mode === 'append';
+  const rawRow = (await loadNoteMeta(env, id))?.row ?? null;
+  let rawPw = '';
+  if (!isProtectedRow(rawRow)) {
+    rawPw = request.headers.get('X-Note-Password') || '';
+    if (rawPw.length > PASSWORD_MAX_LENGTH) return badRequest();
+  }
   const saved = append
     ? await saveNote(env, id, raw, { append: true })
     : await saveNote(env, id, raw);
+  if (rawPw !== '') await setNotePassword(env, id, rawPw);
   return cliReceipt(url, id, append ? 'Appended' : 'Saved', saved.updatedAt, saved.expiresAt);
 }
 

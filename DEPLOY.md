@@ -278,6 +278,10 @@ curl -H 'X-Note-Password: pw123' "$BASE/smoke-pw.txt"           # hello
 curl "$BASE/smoke-pw.txt?pw=pw123"                              # hello
 curl -s -d 'current=pw123&new=' "$BASE/smoke-pw/password"       # remove lock
 curl "$BASE/smoke-pw.txt"                                       # hello
+
+# One-step: save and lock together (only for a note with no password yet).
+echo hello | curl --data-binary @- -H 'X-Note-Password: pw123' "$BASE/smoke-pw2"
+curl -s -o /dev/null -w '%{http_code}\n' "$BASE/smoke-pw2.txt"   # 401
 ```
 
 In a browser: the home page redirects to a random ID. Type some text. The note

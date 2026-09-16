@@ -105,6 +105,16 @@ Lock a note with a password:
 curl -d 'new=secret' https://<your-worker>/my-note/password
 ```
 
+Or save and lock in one step. Add the password to the write:
+
+```sh
+echo hello | curl --data-binary @- -H 'X-Note-Password: secret' https://<your-worker>/my-note
+curl -d 'text=hello&new=secret' https://<your-worker>/my-note
+```
+
+One step works only for a note with no password yet. A locked note needs
+`POST /:note/password` to change or remove the password.
+
 Read it. Use the header or `?pw=`:
 
 ```sh
