@@ -46,8 +46,9 @@ Cron Trigger └─ runs at 03:00 UTC every day to delete expired notes
     (`content_encoding = 'identity'`).
   - A bigger body is compressed with zstd (`content_encoding = 'zstd'`).
 - The table has `created_at`, `updated_at`, and `expires_at`. It also has
-  reserved password columns: `is_protected`, `password_hash`, `password_salt`,
-  and `password_algo`.
+  password columns: `is_protected`, `password_hash`, `password_salt`, and
+  `password_algo`. A locked note stores only a PBKDF2 hash, never the
+  password.
 - The app must run at the root of a site. It uses `/<id>` and `/favicon.ico`.
 
 ---
@@ -268,6 +269,15 @@ curl -s -o /dev/null -w '%{http_code}\n' "$BASE/favicon.ico"     # 200
 # 6. Check the stored encoding and expiry.
 npx wrangler d1 execute web-notepad --remote \
   --command "SELECT id, content_encoding, size_raw, size_stored, expires_at FROM notes LIMIT 5"
+
+# 7. Password lock (uses a separate note).
+echo hello | curl --data-binary @- "$BASE/smoke-pw"
+curl -s -d 'new=pw123' "$BASE/smoke-pw/password"
+curl -s -o /dev/null -w '%{http_code}\n' "$BASE/smoke-pw.txt"   # 401
+curl -H 'X-Note-Password: pw123' "$BASE/smoke-pw.txt"           # hello
+curl "$BASE/smoke-pw.txt?pw=pw123"                              # hello
+curl -s -d 'current=pw123&new=' "$BASE/smoke-pw/password"       # remove lock
+curl "$BASE/smoke-pw.txt"                                       # hello
 ```
 
 In a browser: the home page redirects to a random ID. Type some text. The note
@@ -407,10 +417,16 @@ requests that do not match a file go to the Worker.
   `wget`. Set a strong token secret with
   `npx wrangler secret put CSRF_SECRET`. Without it, the Worker uses a
   built-in default.
-- Workers do not provide built-in HTTP Basic Auth. For access control, use
-  Cloudflare Access or add auth code to the Worker.
-- Password view is not enabled yet. The table has the `password_*` columns. A
-  future version should hash with PBKDF2 (`crypto.subtle`) and use
-  `is_protected` to control reads.
-- A note ID is 5 random characters (about 17 million combinations). This is
-  **not** strong access control. Do not rely on the ID to hide secret content.
+- A note can be locked with a password. The lock button in the status bar
+  sets, changes, or removes it. The Worker stores only a PBKDF2-SHA256 hash
+  (100,000 rounds), never the password.
+- A locked note needs the password on reads and writes. Reads accept the
+  `X-Note-Password` header or `?pw=`. Writes accept only the header. A
+  missing or wrong password returns `401`.
+- The browser asks for the password one time. It then remembers the password
+  in localStorage for that note.
+- Note passwords protect single notes, not the whole site. For site-wide
+  control, use Cloudflare Access.
+- A new note gets a 5-character random ID (about 17 million combinations).
+  You can also pick your own ID of any length. Either way, the ID is **not**
+  strong access control. Do not rely on the ID to hide secret content.

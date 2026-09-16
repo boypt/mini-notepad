@@ -27,6 +27,7 @@ steps.
 - Read, write, and append from the command line (`curl`, `wget`). See
   [Command line](#command-line).
 - Auto-save, line numbers, font size, copy/paste buttons, and an expiry choice.
+- Lock a note with a password. The status bar shows the lock state.
 - Made for IT maintenance and programmers who need to share code or text
   quickly.
 
@@ -36,6 +37,7 @@ The output menu opens a file name:
 
 - `/<id>.txt` gives plain text.
 - `/<id>.base64` gives Base64.
+- A locked note asks for the password first.
 
 ## Command line
 
@@ -95,6 +97,32 @@ You can also save a new body and set the expiry in one call:
 curl -d 'text=hello&expires=24h' https://<your-worker>/my-note
 ```
 
+### Password
+
+Lock a note with a password:
+
+```sh
+curl -d 'new=secret' https://<your-worker>/my-note/password
+```
+
+Read it. Use the header or `?pw=`:
+
+```sh
+curl -H 'X-Note-Password: secret' https://<your-worker>/my-note.txt
+curl https://<your-worker>/my-note.txt?pw=secret
+```
+
+Without the password, reads and writes return `401`. Change the password,
+or remove it with an empty `new`:
+
+```sh
+curl -d 'current=secret&new=new-secret' https://<your-worker>/my-note/password
+curl -d 'current=secret&new=' https://<your-worker>/my-note/password
+```
+
+In the browser, click the lock button in the status bar. The browser asks
+for the password one time and remembers it for that note.
+
 ## Routes (reference)
 
 | Route | What it does |
@@ -105,6 +133,7 @@ curl -d 'text=hello&expires=24h' https://<your-worker>/my-note
 | `GET /:note.base64` | Shows the note as Base64. |
 | `POST /:note` (form field `text`) | Saves the note. An empty `text` deletes it. |
 | `POST /:note/expire` (form field `expires`) | Changes the expiry only. Keeps the body. |
+| `POST /:note/password` (form fields `current`, `new`) | Sets, changes, or removes the password. An empty `new` removes it. |
 | `POST /:note` (raw body) | CLI save. |
 | `POST /:note/append` (raw body) | CLI append. |
 | `POST /` (raw body) | CLI save to a new random ID. |
@@ -114,6 +143,9 @@ Notes:
 - A note ID uses only these characters: `a-z`, `A-Z`, `0-9`, `_`, and `-`.
   Any length is allowed.
 - A file suffix we do not know (for example `/index.jsp`) returns `400`.
+- A locked note needs its password. Reads accept the `X-Note-Password`
+  header or `?pw=`. Writes accept only the header. A missing or wrong
+  password returns `401`.
 
 ## Files
 

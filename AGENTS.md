@@ -64,7 +64,9 @@ npm run db:gc              # one-off remote GC of expired notes
   `decompress` also reads `gzip`/`identity`, so codec or rollback changes need
   no backfill.
 - `is_protected` / `password_hash` / `password_salt` / `password_algo` columns
-  exist but are not enforced yet.
+  enforce the password lock (`POST /:note/password`, PBKDF2-SHA256, 100k
+  rounds). Reads take `X-Note-Password` or `?pw=`; writes take only the
+  header; a bad or missing password returns 401.
 
 ## HTTP behavior
 
@@ -78,7 +80,8 @@ npm run db:gc              # one-off remote GC of expired notes
   `X-Robots-Tag: noindex, nofollow`.
 - A form save and `POST /:note/expire` return JSON
   `{ created_at, updated_at, expires_at }` (`expires_at` may be `null`). An
-  empty `text` delete returns `{ "deleted": true }`. CLI writes get a plain-text
+  empty `text` delete returns `{ "deleted": true }`. A password change returns
+  `{ protected, updated_at }`. CLI writes get a plain-text
   receipt instead. An unknown file suffix (for example `/index.jsp`) returns
   `400`.
 
