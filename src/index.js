@@ -18,6 +18,8 @@
  *                                    loader can tell a new note apart)
  *   - POST /:note  (form `text`) -> save; empty `text` deletes
  *   - POST /:note/expire (form `expires`) -> change expiry, keep the body
+ *   - POST /:note/password (form `csrf` + `current` + `new`) -> set/change/
+ *                                    cancel the password; `new` empty cancels
  *   - POST /:note  (raw body)    -> CLI save
  *   - POST /:note/append         -> CLI append
  *   - POST /       (CLI)         -> CLI save to a new random id; receipt shows id
@@ -30,6 +32,16 @@
  *     the body is loaded via XHR GET /:note.txt. An XHR for a missing
  *     note gets 404; a direct navigation to a missing .txt redirects
  *     back to the editor.
+ *   - Password lock: a note with is_protected=1 (plus hash/salt/algo) needs
+ *     its password for every read (all modes + CLI bare GET) and every
+ *     write (save/delete/append/expire). Reads take the password from the
+ *     `X-Note-Password` header or the `?pw=` query (either one passing is
+ *     enough); writes only take the header, never `?pw=`, so a mutated URL
+ *     cannot leak into history or logs. `POST /:note/password` takes the
+ *     current password from the form `current` field instead.
+ *   - 401 means "Password required" (plain text); 403 means bad CSRF;
+ *     404 means missing/expired. Passwords never appear in bodies,
+ *     receipts, JSON, or logs.
  *
  * Storage:
  *   - Bodies are zstd-compressed (node:zlib) before they are written to D1;
@@ -41,8 +53,10 @@
  *     no choice keeps the note's existing expiry (NOTE_TTL_DAYS is only the
  *     default for a brand-new note).
  *   - Password columns (password_hash / password_salt / password_algo /
- *     is_protected) are reserved for a future password-protected view.
- *     They are stored but not yet enforced.
+ *     is_protected) enforce the password lock: PBKDF2-SHA256 (100k
+ *     iterations), 16-byte salt, 32-byte derived key, all base64. Content
+ *     saves never touch the password columns, so saving keeps the lock;
+ *     only POST /:note/password or a full delete changes it.
  *
  * The helper exports below are exported so they can be unit-tested with
  * plain Node; the Worker entrypoint is the default export.
@@ -67,6 +81,15 @@ const EXPIRY_TOKENS = {
   '72h': 3 * DAY_MS,
   '1w': 7 * DAY_MS,
 };
+/** PBKDF2 iteration count for note passwords. */
+const PBKDF2_ITERATIONS = 100000;
+/** Algorithm tag stored in notes.password_algo; only this value is accepted. */
+const PASSWORD_ALGO = 'pbkdf2-sha256-100k';
+/** Salt length (bytes) and derived-key length (bits) for note passwords. */
+const PASSWORD_SALT_BYTES = 16;
+const PASSWORD_KEY_BITS = 256;
+/** Longest accepted new password (characters); '' on the password route cancels. */
+const PASSWORD_MAX_LENGTH = 256;
 /** User agents allowed to use the raw command-line write path. */
 const CLI_USER_AGENTS = ['curl', 'wget'];
 /** Fallback CSRF secret for local/dev; set CSRF_SECRET in production. */
@@ -254,7 +277,8 @@ async function deleteNote(env, id) {
  */
 async function loadNote(env, id) {
   const row = await env.DB.prepare(
-    `SELECT id, content, content_encoding, created_at, updated_at, expires_at, is_protected
+    `SELECT id, content, content_encoding, created_at, updated_at, expires_at, is_protected,
+            password_hash, password_salt, password_algo
        FROM notes WHERE id = ? LIMIT 1`,
   ).bind(id).first();
 
@@ -277,7 +301,8 @@ async function loadNote(env, id) {
  */
 async function loadNoteMeta(env, id) {
   const row = await env.DB.prepare(
-    `SELECT id, created_at, updated_at, expires_at, is_protected
+    `SELECT id, created_at, updated_at, expires_at, is_protected,
+            password_hash, password_salt, password_algo
        FROM notes WHERE id = ? LIMIT 1`,
   ).bind(id).first();
 
@@ -426,6 +451,127 @@ function verifyCsrf(env, id, token) {
 }
 
 // ---------------------------------------------------------------------------
+// Note passwords (PBKDF2-SHA256, WebCrypto subtle; no new dependencies)
+// ---------------------------------------------------------------------------
+
+/**
+ * Hash a password with a fresh random salt. Returns base64 strings plus the
+ * algorithm tag, ready for the notes columns.
+ */
+export async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(PASSWORD_SALT_BYTES));
+  const key = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, [
+    'deriveBits',
+  ]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
+    key,
+    PASSWORD_KEY_BITS,
+  );
+  return {
+    hash_b64: Buffer.from(bits).toString('base64'),
+    salt_b64: Buffer.from(salt).toString('base64'),
+    algo: PASSWORD_ALGO,
+  };
+}
+
+/**
+ * Check a password against a notes row. Only our own algorithm tag is
+ * accepted; any malformed row fails closed (returns false, never throws).
+ */
+export async function verifyPassword(password, row) {
+  try {
+    if (!row || row.password_algo !== PASSWORD_ALGO) return false;
+    if (typeof row.password_hash !== 'string' || typeof row.password_salt !== 'string') {
+      return false;
+    }
+    if (!row.password_hash || !row.password_salt) return false;
+    const expected = Buffer.from(row.password_hash, 'base64');
+    const salt = new Uint8Array(Buffer.from(row.password_salt, 'base64'));
+    if (expected.length === 0 || salt.length === 0) return false;
+    const key = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, [
+      'deriveBits',
+    ]);
+    const bits = await crypto.subtle.deriveBits(
+      { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
+      key,
+      PASSWORD_KEY_BITS,
+    );
+    const actual = Buffer.from(bits);
+    if (actual.length !== expected.length) return false;
+    return timingSafeEqual(actual, expected);
+  } catch (err) {
+    return false;
+  }
+}
+
+/**
+ * True only when the row is locked: is_protected=1 AND the hash, salt, and
+ * algorithm columns are all present. Anything else reads/writes as public.
+ */
+function isProtectedRow(row) {
+  return (
+    !!row &&
+    row.is_protected === 1 &&
+    !!row.password_hash &&
+    !!row.password_salt &&
+    !!row.password_algo
+  );
+}
+
+/**
+ * Read credential: the `X-Note-Password` header wins when non-empty,
+ * otherwise the `?pw=` query value (not trimmed). Both missing means ''.
+ */
+function getReadPassword(request, url) {
+  const header = request.headers.get('X-Note-Password');
+  if (header != null && header !== '') return header;
+  const query = url.searchParams.get('pw');
+  if (query != null && query !== '') return query;
+  return '';
+}
+
+/** Uniform 401 for a locked note: plain text, no password anywhere in it. */
+function passwordRequired() {
+  return new Response('Password required', {
+    status: 401,
+    headers: noStore({ 'Content-Type': 'text/plain; charset=utf-8' }),
+  });
+}
+
+/**
+ * Read gate for a loaded row. Returns a 401 Response when the row is locked
+ * and neither credential passes; null when the read may proceed (public
+ * notes ignore any credential). Header and query are OR: a wrong header
+ * never shadows a correct ?pw=, and vice versa.
+ */
+async function checkReadPassword(request, url, row) {
+  if (!isProtectedRow(row)) return null;
+  const first = getReadPassword(request, url);
+  if (first && (await verifyPassword(first, row))) return null;
+  const header = request.headers.get('X-Note-Password') || '';
+  const query = url.searchParams.get('pw') || '';
+  const second = first === header ? query : header;
+  if (second && second !== first && (await verifyPassword(second, row))) return null;
+  return passwordRequired();
+}
+
+/**
+ * Write gate for POST /:note, /:note/append, and /:note/expire. Only the
+ * `X-Note-Password` header counts (never `?pw=`). Returns a 401 Response on
+ * failure, null when the write may proceed. Missing rows pass (creation is
+ * always allowed); a wrong password never reveals more than the 401.
+ */
+async function checkWritePassword(env, request, id) {
+  const found = await loadNoteMeta(env, id);
+  const row = found ? found.row : null;
+  if (!isProtectedRow(row)) return null;
+  const password = request.headers.get('X-Note-Password') || '';
+  if (!password) return passwordRequired();
+  return (await verifyPassword(password, row)) ? null : passwordRequired();
+}
+
+// ---------------------------------------------------------------------------
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
@@ -450,12 +596,67 @@ function cliDeleted(id) {
   return textOk(`Deleted.\nNote:    ${id}\n`);
 }
 
-async function handlePost(request, env, id, mode) {
+async function handlePost(request, env, ctx, id, mode) {
   const contentType = request.headers.get('content-type') || '';
   const userAgent = request.headers.get('user-agent') || '';
   const cli = isCliUserAgent(userAgent);
   const raw = await request.text();
   const url = new URL(request.url);
+
+  // Password set/change/cancel: `POST /:note/password` with form fields
+  // `csrf`, `current` (needed only when locked), and `new` (`''` cancels).
+  // Order: missing/expired -> 404, wrong current -> 401, bad CSRF -> 403.
+  if (mode === 'password') {
+    let found = await loadNoteMeta(env, id);
+    if (found && found.expired) {
+      ctx.waitUntil(deleteNote(env, id));
+      found = null;
+    }
+    if (!found) return notFound();
+    const params = new URLSearchParams(raw);
+    if (!params.has('new')) return badRequest();
+    const updated = params.get('new') ?? '';
+    if (updated.length > PASSWORD_MAX_LENGTH) return badRequest();
+    if (isProtectedRow(found.row)) {
+      const current = params.get('current') ?? '';
+      if (!(await verifyPassword(current, found.row))) return passwordRequired();
+    }
+    if (!cli && !verifyCsrf(env, id, params.get('csrf'))) return forbidden();
+    const now = Date.now();
+    let locked;
+    if (updated === '') {
+      await env.DB.prepare(
+        `UPDATE notes SET is_protected = 0, password_hash = NULL,
+                          password_salt = NULL, password_algo = NULL, updated_at = ?
+           WHERE id = ?`,
+      ).bind(now, id).run();
+      locked = false;
+    } else {
+      const secret = await hashPassword(updated);
+      await env.DB.prepare(
+        `UPDATE notes SET is_protected = 1, password_hash = ?,
+                          password_salt = ?, password_algo = ?, updated_at = ?
+           WHERE id = ?`,
+      ).bind(secret.hash_b64, secret.salt_b64, secret.algo, now, id).run();
+      locked = true;
+    }
+    if (cli) {
+      return textOk(
+        [
+          locked ? 'Password set.' : 'Protection removed.',
+          `Note:    ${id}`,
+          `Protected: ${locked ? 'yes' : 'no'}`,
+          '',
+        ].join('\n'),
+      );
+    }
+    return jsonOk({ protected: locked, updated_at: now });
+  }
+
+  // Write gate: a locked note needs the right `X-Note-Password` header for
+  // every content/expiry write (?pw= never counts here).
+  const writeDeny = await checkWritePassword(env, request, id);
+  if (writeDeny) return writeDeny;
 
   // Expiry-only update: `POST /:note/expire` with form `expires`. The body is
   // left untouched. This is a dedicated route so a raw CLI body that happens to
@@ -538,6 +739,7 @@ function modeResponse(loaded, mode) {
 }
 
 async function handleGet(request, env, ctx, id, mode) {
+  const url = new URL(request.url);
   if (mode) {
     let loaded = await loadNote(env, id);
     if (loaded && loaded.expired) {
@@ -551,6 +753,8 @@ async function handleGet(request, env, ctx, id, mode) {
       if (request.headers.get('X-Requested-With') === 'XMLHttpRequest') return notFound();
       return redirect('/' + id);
     }
+    const readDeny = await checkReadPassword(request, url, loaded.row);
+    if (readDeny) return readDeny;
     return modeResponse(loaded, mode);
   }
 
@@ -561,6 +765,10 @@ async function handleGet(request, env, ctx, id, mode) {
       ctx.waitUntil(deleteNote(env, id));
       loaded = null;
     }
+    if (loaded) {
+      const readDeny = await checkReadPassword(request, url, loaded.row);
+      if (readDeny) return readDeny;
+    }
     return new Response(loaded ? loaded.text : '', {
       status: 200,
       headers: noStore({ 'Content-Type': 'text/plain; charset=utf-8' }),
@@ -568,7 +776,8 @@ async function handleGet(request, env, ctx, id, mode) {
   }
 
   // Browser shell: metadata only, no body BLOB decompression. The body is
-  // fetched after page load via XHR GET /:note.txt.
+  // fetched after page load via XHR GET /:note.txt. The shell is always 200;
+  // meta only says whether the note is protected (never any hash material).
   let metaLoaded = await loadNoteMeta(env, id);
   if (metaLoaded && metaLoaded.expired) {
     ctx.waitUntil(deleteNote(env, id));
@@ -580,8 +789,9 @@ async function handleGet(request, env, ctx, id, mode) {
         createdAt: metaLoaded.row.created_at ?? null,
         updatedAt: metaLoaded.row.updated_at ?? null,
         expiresAt: metaLoaded.row.expires_at ?? null,
+        protected: isProtectedRow(metaLoaded.row),
       }
-    : { createdAt: null, updatedAt: null, expiresAt: null };
+    : { createdAt: null, updatedAt: null, expiresAt: null, protected: false };
   meta.csrf = csrfToken(env, id);
   return new Response(renderPage(id, '', meta), {
     status: 200,
@@ -698,6 +908,24 @@ select:disabled {
     cursor: not-allowed;
     opacity: 0.6;
 }
+#lock-note {
+    font: inherit;
+    font-size: 12px;
+    color: inherit;
+    background: #fff;
+    border: 1px solid #d3d8de;
+    border-radius: 6px;
+    padding: 4px 8px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+#lock-note:hover {
+    background: #f2f4f7;
+}
+#lock-note:focus-visible {
+    outline: 2px solid #5b8def;
+    outline-offset: 1px;
+}
 .sep {
     width: 1px;
     align-self: stretch;
@@ -793,6 +1021,13 @@ main {
         color: #6b6d66;
         background: #23241f;
     }
+    #lock-note {
+        background: #282923;
+        border-color: #4a4b45;
+    }
+    #lock-note:hover {
+        background: #33342d;
+    }
     button.icon:not(:disabled):hover {
         background: #33342d;
     }
@@ -886,6 +1121,7 @@ main {
     </main>
     <footer class="statusbar">
         <span id="saved-at">Loading…</span>
+        <button type="button" id="lock-note" title="Password protection" aria-label="Password protection">${meta.protected ? '🔒 Protected' : '○ Public'}</button>
         <span class="grow"></span>
         <label for="expiry">Expires
             <select id="expiry" aria-label="Expiry">
@@ -920,6 +1156,7 @@ main {
     var fontIncrease = document.getElementById('font-increase');
     var copyButton = document.getElementById('copy-note');
     var pasteButton = document.getElementById('paste-note');
+    var lockButton = document.getElementById('lock-note');
 
     var meta;
     try {
@@ -939,6 +1176,108 @@ main {
     function updatePrintable(value) {
         while (printable.firstChild) printable.removeChild(printable.firstChild);
         printable.appendChild(document.createTextNode(value));
+    }
+
+    // Password lock state. The cleartext password lives in memory; a copy
+    // goes to localStorage only after the server accepts it (HTTP 200).
+    // A 401/403 wipes the stored copy.
+    var notePw = '';
+    var pwFromUrl = false;
+    var pwPrompted = false;
+    var pwLocked = false;
+
+    function pwKey() {
+        return 'web-notepad-pw-' + NOTE_ID;
+    }
+
+    function storePw(pw) {
+        try {
+            window.localStorage.setItem(pwKey(), pw);
+        } catch (err) {
+            // Storage can be blocked; the memory copy still works.
+        }
+    }
+
+    function clearStoredPw() {
+        try {
+            window.localStorage.removeItem(pwKey());
+        } catch (err) {
+            // Nothing to clean up.
+        }
+    }
+
+    // Read ?pw= with a hand-rolled parser (no modern query helper, so old
+    // browsers work): manual parse of location.search, first pw key wins,
+    // %-decoded.
+    function queryPw() {
+        try {
+            var s = window.location.search || '';
+            if (s.charAt(0) === '?') s = s.slice(1);
+            var parts = s.split('&');
+            for (var i = 0; i < parts.length; i++) {
+                var kv = parts[i];
+                var eq = kv.indexOf('=');
+                var k = eq === -1 ? kv : kv.slice(0, eq);
+                if (k === 'pw') {
+                    var v = eq === -1 ? '' : kv.slice(eq + 1);
+                    if (!v) return '';
+                    try {
+                        return decodeURIComponent(v.replace(/\\+/g, ' '));
+                    } catch (err2) {
+                        return v;
+                    }
+                }
+            }
+        } catch (err) {
+            // No query string available.
+        }
+        return '';
+    }
+
+    // Drop ?pw= from the address bar after it proved valid (success path).
+    function stripQueryPw() {
+        pwFromUrl = false;
+        try {
+            if (window.history && window.history.replaceState) {
+                window.history.replaceState(null, '', '/' + NOTE_ID);
+            }
+        } catch (err) {
+            // History may be unavailable; the ?pw= simply stays.
+        }
+    }
+
+    function updateLockUI() {
+        if (!lockButton) return;
+        if (meta.protected) {
+            lockButton.textContent = '🔒 Protected';
+            lockButton.title = 'Password protected — click to change';
+        } else {
+            lockButton.textContent = '○ Public';
+            lockButton.title = 'No password — click to set one';
+        }
+    }
+
+    // Park the editor in "locked" state: no editing until the lock is
+    // clicked again with the right password.
+    function lockForPassword() {
+        pwLocked = true;
+        textarea.disabled = true;
+        textarea.placeholder = 'Password required — click lock to retry';
+        savedAtEl.textContent = 'Password required';
+        saveButton.disabled = true;
+        contentLoading = false;
+        updateLockUI();
+    }
+
+    try {
+        notePw = window.localStorage.getItem(pwKey()) || '';
+    } catch (err) {
+        notePw = '';
+    }
+    var urlPw = queryPw();
+    if (!notePw && urlPw) {
+        notePw = urlPw;
+        pwFromUrl = true;
     }
 
     function pad(n) {
@@ -1097,6 +1436,7 @@ main {
         var request = new XMLHttpRequest();
         request.open('POST', url || window.location.href, true);
         request.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
+        if (notePw) request.setRequestHeader('X-Note-Password', notePw);
         request.onload = function () {
             var ok = request.readyState === 4 && request.status >= 200 && request.status < 300;
             if (ok) {
@@ -1106,6 +1446,11 @@ main {
                         meta.createdAt = null;
                         meta.updatedAt = null;
                         meta.expiresAt = null;
+                        meta.protected = false;
+                        notePw = '';
+                        pwFromUrl = false;
+                        clearStoredPw();
+                        updateLockUI();
                         showSavedAt(null);
                         updateOutputState();
                     } else if (data && data.updated_at != null) {
@@ -1118,6 +1463,12 @@ main {
                 } catch (err) {
                     // Non-JSON responses are ignored.
                 }
+                if (notePw) storePw(notePw);
+                if (pwFromUrl) stripQueryPw();
+            }
+            if (request.status === 401 || request.status === 403) {
+                notePw = '';
+                clearStoredPw();
             }
             if (onDone) onDone(ok);
         };
@@ -1155,6 +1506,7 @@ main {
         var request = new XMLHttpRequest();
         request.open('GET', '/' + NOTE_ID + '.txt', true);
         request.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+        if (notePw) request.setRequestHeader('X-Note-Password', notePw);
         request.onreadystatechange = function () {
             if (request.readyState !== 4) return;
             var status = request.status;
@@ -1175,17 +1527,39 @@ main {
                 updatePrintable(textarea.value);
                 unlockEditor();
                 showSavedAt(meta.updatedAt);
+                pwLocked = false;
+                if (notePw) storePw(notePw);
+                if (pwFromUrl) stripQueryPw();
             } else if (status === 404) {
                 content = '';
                 updatePrintable(textarea.value);
                 unlockEditor();
                 showSavedAt(meta.updatedAt);
-            } else if (status === 401 || status === 403) {
-                // password-protected hook: a future password view unlocks here.
-                textarea.disabled = true;
-                textarea.placeholder = 'This note needs a password';
-                savedAtEl.textContent = 'Password required';
-                contentLoading = false;
+            } else if (status === 401) {
+                // Locked note, password missing or wrong: ask exactly once.
+                // A typed password retries the load a single time; a second
+                // 401 (or cancel) parks the editor on the lock button.
+                notePw = '';
+                clearStoredPw();
+                if (!pwPrompted) {
+                    pwPrompted = true;
+                    var attempt = null;
+                    try {
+                        attempt = window.prompt('This note is protected. Enter the password:', '');
+                    } catch (err) {
+                        attempt = null;
+                    }
+                    if (attempt !== null && attempt !== '') {
+                        notePw = attempt;
+                        loadContent();
+                        return;
+                    }
+                }
+                lockForPassword();
+            } else if (status === 403) {
+                notePw = '';
+                clearStoredPw();
+                lockForPassword();
             } else {
                 content = '';
                 textarea.disabled = false;
@@ -1340,9 +1714,96 @@ main {
         }
     });
 
+    function postPassword(current, next) {
+        var request = new XMLHttpRequest();
+        request.open('POST', '/' + NOTE_ID + '/password', true);
+        request.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
+        request.onreadystatechange = function () {
+            if (request.readyState !== 4) return;
+            if (request.status >= 200 && request.status < 300) {
+                var data = null;
+                try {
+                    data = JSON.parse(request.responseText);
+                } catch (err) {
+                    data = null;
+                }
+                meta.protected = !!(data && data.protected);
+                if (meta.protected) {
+                    notePw = next;
+                    storePw(next);
+                } else {
+                    notePw = '';
+                    clearStoredPw();
+                }
+                pwFromUrl = false;
+                updateLockUI();
+            } else if (request.status === 401) {
+                notePw = '';
+                clearStoredPw();
+                window.alert('Wrong password. Nothing changed.');
+            } else if (request.status === 403) {
+                notePw = '';
+                clearStoredPw();
+                window.alert('Forbidden. Reload the page and try again.');
+            } else {
+                window.alert('Could not change the password. Try again.');
+            }
+        };
+        request.onerror = function () {
+            window.alert('Could not change the password. Try again.');
+        };
+        request.send('csrf=' + encodeURIComponent(meta.csrf || '') +
+            '&current=' + encodeURIComponent(current) +
+            '&new=' + encodeURIComponent(next));
+    }
+
+    function changePassword() {
+        var current, next, fresh;
+        if (meta.protected) {
+            current = window.prompt('Enter the current password (empty = cancel):', '');
+            if (current === null || current === '') return;
+            next = window.prompt('Enter the new password (empty = remove protection):', '');
+            if (next === null) return;
+            if (next === '' && !window.confirm('Remove password protection from this note?')) return;
+            postPassword(current, next);
+        } else {
+            fresh = window.prompt('Set a password for this note (empty = cancel):', '');
+            if (fresh === null || fresh === '') return;
+            postPassword('', fresh);
+        }
+    }
+
+    // The lock button doubles as the retry entry: when parked on 401 it
+    // reloads with a fresh password, otherwise it runs the change flow.
+    function onLockClick() {
+        if (pwLocked) {
+            var attempt = null;
+            try {
+                attempt = window.prompt('Enter the password:', '');
+            } catch (err) {
+                attempt = null;
+            }
+            if (attempt === null || attempt === '') return;
+            notePw = attempt;
+            pwPrompted = true;
+            pwLocked = false;
+            contentLoading = true;
+            textarea.disabled = true;
+            textarea.placeholder = 'Loading…';
+            savedAtEl.textContent = 'Loading…';
+            saveButton.disabled = true;
+            loadContent();
+            return;
+        }
+        changePassword();
+    }
+
+    if (lockButton) lockButton.addEventListener('click', onLockClick);
+
     savedAtEl.textContent = 'Loading…';
     pickExpiry();
     updateOutputState();
+    updateLockUI();
     textarea.disabled = true;
     saveButton.disabled = true;
     loadContent();
@@ -1372,7 +1833,7 @@ export default {
       if (request.method === 'POST') {
         const userAgent = request.headers.get('user-agent') || '';
         if (!isCliUserAgent(userAgent)) return forbidden();
-        return handlePost(request, env, await freshNoteId(env), '');
+        return handlePost(request, env, ctx, await freshNoteId(env), '');
       }
       return redirect('/' + randomNoteId());
     }
@@ -1403,7 +1864,7 @@ export default {
 
     const mode = suffixMode || pathMode || url.searchParams.get('mode') || '';
 
-    if (request.method === 'POST') return handlePost(request, env, id, mode);
+    if (request.method === 'POST') return handlePost(request, env, ctx, id, mode);
     if (request.method !== 'GET' && request.method !== 'HEAD') return notFound();
 
     return handleGet(request, env, ctx, id, mode);
