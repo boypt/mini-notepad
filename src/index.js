@@ -2428,6 +2428,92 @@ export function renderPageView(id, text, meta, origin) {
 
 
 // ---------------------------------------------------------------------------
+// Instance skill doc (/SKILLS.md)
+// ---------------------------------------------------------------------------
+
+/** Usage doc served by this instance at GET /SKILLS.md. */
+export function skillsDoc(origin) {
+  const base = origin || 'BASE';
+  return ('# Web Notepad Skills\n'
+  + '\n'
+  + 'This file explains how to use this Web Notepad instance.\n'
+  + 'The base URL below is the host that serves this file.\n'
+  + '\n'
+  + '## Save a note\n'
+  + '\n'
+  + 'Browser: open / and type. The page saves on its own.\n'
+  + 'Pick any ID: open /my-note and type. An empty save deletes the note.\n'
+  + '\n'
+  + 'CLI (curl or wget user agent):\n'
+  + '\n'
+  + 'echo hello | curl --data-binary @- BASE/my-note\n'
+  + 'echo hello | curl --data-binary @- BASE/   # new random ID, receipt shows it\n'
+  + '\n'
+  + 'A save prints a receipt with Note, Saved, Expires, and read URLs.\n'
+  + '\n'
+  + '## Read a note\n'
+  + '\n'
+  + 'curl BASE/my-note            # raw text (curl/wget only)\n'
+  + 'curl BASE/my-note.txt        # plain text\n'
+  + 'curl BASE/my-note.base64     # Base64\n'
+  + 'curl BASE/my-note.page       # Markdown page (HTML)\n'
+  + '\n'
+  + 'Browsers open /my-note and get the editor.\n'
+  + '\n'
+  + '## Output modes\n'
+  + '\n'
+  + 'Three spellings, first match wins: suffix, second path part, ?mode=.\n'
+  + '\n'
+  + '/my-note.txt = plain, /my-note.base64 = base64, /my-note.page = page.\n'
+  + '/my-note/plain, /my-note/mtime, /my-note/html, /my-note/css,\n'
+  + '/my-note/js, /my-note/json, /my-note/page.\n'
+  + '/my-note?mode=page\n'
+  + '\n'
+  + 'mtime = updated_at as unix seconds. html/css/js/json = body as that type.\n'
+  + 'An unknown suffix (for example /index.jsp) returns 400.\n'
+  + '\n'
+  + '## .page\n'
+  + '\n'
+  + '/my-note.page renders Markdown to a plain article page (no JS).\n'
+  + 'The first "# Title" line becomes the page title.\n'
+  + 'The page head has og:title and og:description, so a link\n'
+  + 'shared to Telegram shows a text preview.\n'
+  + '\n'
+  + '## Append\n'
+  + '\n'
+  + 'echo " world" | curl --data-binary @- BASE/my-note/append\n'
+  + '\n'
+  + '## Expiry\n'
+  + '\n'
+  + 'Tokens: 24h, 72h, 1w, never. New notes live 30 days by default.\n'
+  + '\n'
+  + 'curl -d \'expires=24h\' BASE/my-note/expire\n'
+  + 'curl -d \'expires=never\' BASE/my-note/expire\n'
+  + '\n'
+  + 'A raw-body CLI save keeps the current expiry.\n'
+  + '\n'
+  + '## Password lock\n'
+  + '\n'
+  + 'curl -d \'new=secret\' BASE/my-note/password\n'
+  + 'curl -H \'X-Note-Password: secret\' BASE/my-note.txt\n'
+  + 'curl \'BASE/my-note.txt?pw=secret\'\n'
+  + '\n'
+  + 'Reads take the header or ?pw=. Writes take only the header.\n'
+  + 'A missing or wrong password returns 401.\n'
+  + 'Change: curl -d \'current=secret&new=other\' BASE/my-note/password\n'
+  + 'Remove: curl -d \'current=secret&new=\' BASE/my-note/password\n'
+  + '\n'
+  + '## IDs and limits\n'
+  + '\n'
+  + 'IDs use a-z A-Z 0-9 _ -, any length.\n'
+  + 'Every response is no-store and noindex.\n'
+  + 'Browser form saves need the page CSRF token (blind POST = 403).\n'
+  + 'Raw writes need a curl or wget user agent.\n'
+  + '').split('BASE').join(base);
+}
+
+
+// ---------------------------------------------------------------------------
 // Worker entrypoint
 // ---------------------------------------------------------------------------
 
@@ -2446,6 +2532,14 @@ export default {
         return handlePost(request, env, ctx, await freshNoteId(env), '');
       }
       return redirect('/' + randomNoteId());
+    }
+
+    // Instance skill doc: exact match only, no note lookup, no password gate.
+    if (segments.length === 1 && segments[0] === 'SKILLS.md') {
+      if (request.method !== 'GET' && request.method !== 'HEAD') return notFound();
+      return new Response(skillsDoc(url.origin), {
+        headers: noStore({ 'Content-Type': 'text/markdown; charset=utf-8' }),
+      });
     }
 
     // Output is addressed by file suffix: /<id>.txt, /<id>.base64, /<id>.page.
