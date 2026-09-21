@@ -2500,6 +2500,19 @@ const mcpStamp = (name) =>
     .number()
     .nullable()
     .describe(`${name}, as milliseconds since the Unix epoch, or null when never.`);
+/** Shareable read URLs returned with every read/write/append result. */
+const mcpUrlsOutput = z
+  .object({
+    plain: z.string().describe('Plain-text read URL.'),
+    base64: z.string().describe('Base64 read URL.'),
+    page: z.string().describe('Markdown article page URL. Share this link.'),
+    editor: z.string().describe('Browser editor URL.'),
+  })
+  .describe('Shareable read URLs for the note.');
+function mcpUrls(origin, id) {
+  const base = `${origin}/${id}`;
+  return { plain: `${base}.txt`, base64: `${base}.base64`, page: `${base}.page`, editor: base };
+}
 
 /** Success result: human-readable text plus machine-readable structured data. */
 function mcpOk(text, structuredContent) {
@@ -2529,8 +2542,9 @@ function mcpWrongPasswordText(id) {
 /**
  * Build a fresh McpServer with the six note tools bound to this request's
  * env/ctx. Called once per HTTP request; the instance is never reused.
+ * `origin` (e.g. https://note.example.com) prefixes the shareable urls.
  */
-function createMcpServer(env, ctx) {
+function createMcpServer(env, ctx, origin) {
   const server = new McpServer({ name: 'web-notepad', version: '1.0.0' });
 
   server.registerTool(
@@ -2571,6 +2585,7 @@ function createMcpServer(env, ctx) {
         created_at: mcpStamp('When the note was created'),
         updated_at: mcpStamp('When the note was last changed'),
         expires_at: mcpStamp('When the note expires'),
+        urls: mcpUrlsOutput,
       }),
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -2608,6 +2623,7 @@ function createMcpServer(env, ctx) {
         created_at: loaded.row.created_at ?? null,
         updated_at: loaded.row.updated_at ?? null,
         expires_at: loaded.row.expires_at ?? null,
+        urls: mcpUrls(origin, id),
       });
     },
   );
@@ -2645,6 +2661,7 @@ function createMcpServer(env, ctx) {
         updated_at: mcpStamp('When the note was written'),
         expires_at: mcpStamp('When the note expires'),
         protected: z.boolean().describe('True when the note is now locked with a password.'),
+        urls: mcpUrlsOutput,
       }),
       annotations: {
         readOnlyHint: false,
@@ -2677,6 +2694,7 @@ function createMcpServer(env, ctx) {
           updated_at: null,
           expires_at: null,
           protected: false,
+          urls: mcpUrls(origin, noteId),
         });
       }
       if (!locked && newPassword !== undefined && newPassword.length > PASSWORD_MAX_LENGTH) {
@@ -2692,9 +2710,10 @@ function createMcpServer(env, ctx) {
         prot = true;
       }
       return mcpOk(
-        isNew
+        (isNew
           ? `Note '${noteId}' was created.${prot ? ' It is locked with a password.' : ''}`
-          : `Note '${noteId}' was saved.${prot && !locked ? ' It is now locked with a password.' : ''}`,
+          : `Note '${noteId}' was saved.${prot && !locked ? ' It is now locked with a password.' : ''}`) +
+          ` Page: ${origin}/${noteId}.page`,
         {
           id: noteId,
           deleted: false,
@@ -2702,6 +2721,7 @@ function createMcpServer(env, ctx) {
           updated_at: saved.updatedAt,
           expires_at: saved.expiresAt,
           protected: prot,
+          urls: mcpUrls(origin, noteId),
         },
       );
     },
@@ -2725,6 +2745,7 @@ function createMcpServer(env, ctx) {
         updated_at: mcpStamp('When the note was written'),
         expires_at: mcpStamp('When the note expires'),
         protected: z.boolean().describe('True when the note is locked with a password.'),
+        urls: mcpUrlsOutput,
       }),
       annotations: {
         readOnlyHint: false,
@@ -2743,13 +2764,16 @@ function createMcpServer(env, ctx) {
       const isNew = !row || !!(found && found.expired);
       const saved = await saveNote(env, id, text, { append: true });
       return mcpOk(
-        isNew ? `Note '${id}' was created with the appended text.` : `Text was appended to note '${id}'.`,
+        (isNew
+          ? `Note '${id}' was created with the appended text.`
+          : `Text was appended to note '${id}'.`) + ` Page: ${origin}/${id}.page`,
         {
           id,
           created: isNew,
           updated_at: saved.updatedAt,
           expires_at: saved.expiresAt,
           protected: isProtectedRow(row),
+          urls: mcpUrls(origin, id),
         },
       );
     },
@@ -2944,7 +2968,7 @@ async function handleMcp(request, env, ctx) {
   const cleanHeaders = new Headers(request.headers);
   cleanHeaders.delete('mcp-session-id');
   const cleanRequest = new Request(request, { headers: cleanHeaders });
-  const server = createMcpServer(env, ctx);
+  const server = createMcpServer(env, ctx, new URL(request.url).origin);
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
   });

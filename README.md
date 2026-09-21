@@ -160,6 +160,9 @@ Six tools:
 | `set_expiry` | Changes only the expiry (`24h`, `72h`, `1w`, `never`). |
 | `set_password` | Sets, changes, or removes the note password. |
 
+Read, write, and append results include `urls`
+(`plain`, `base64`, `page`, `editor`). Share the `page` link.
+
 Add it to your client. You only need the URL. No headers, no keys.
 
 Cursor, VS Code, and Claude Desktop use `mcp-remote`:
@@ -201,6 +204,8 @@ at https://<your-worker>/mcp. Use its MCP tools:
 - set_password to lock, unlock, or change a note password.
 
 Rules: note ids use a-z, A-Z, 0-9, _ and -.
+Read, write, and append results include urls:
+share the page link when I ask for a link.
 A locked note needs its password argument; without it the
 tool fails with a hint. There is no list of notes: ask me
 for the id when you do not know it.
