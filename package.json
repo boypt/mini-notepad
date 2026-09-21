@@ -13,8 +13,5 @@
   },
   "devDependencies": {
     "wrangler": "^4.130.0"
-  },
-  "dependencies": {
-    "markdown-it": "^14.1.0"
   }
 }

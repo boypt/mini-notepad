@@ -10,7 +10,8 @@
  *                                    GET /:note.txt
  *   - GET  /:note.txt            -> stored note as plain text
  *   - GET  /:note.base64         -> stored note as base64
- *   - GET  /:note.page           -> stored note as a Markdown page
+ *   - GET  /:note.page           -> empty Markdown shell; the browser
+ *                                    fetches /:note.txt by XHR and renders it
  *   - GET  /:note/:mode          -> stored note in that mode (legacy; plain,
  *                                    base64, mtime, html, css, js, json;
  *                                    unknown == raw)
@@ -72,7 +73,6 @@
 import zlib from 'node:zlib';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { Buffer } from 'node:buffer';
-import MarkdownIt from 'markdown-it';
 
 const NOTE_ID_RE = /^[a-zA-Z0-9_-]+$/;
 const MODE_RE = /^[a-z0-9]*$/;
@@ -779,18 +779,22 @@ function modeResponse(loaded, mode, extra) {
     case 'json':
       return new Response(text, { headers: headers('application/json; charset=utf-8') });
     case 'page': {
+      // Body-free shell: the text is never loaded for `.page`. Only the row
+      // metadata (id, dates) feeds the shell. Locked notes get the same shell;
+      // the browser loader prompts for the password when `.txt` 401s.
       const row = loaded.row || {};
       const origin = (extra && extra.origin) || '';
       const userAgent = (extra && extra.userAgent) || '';
       const headers = noStore({ 'Content-Type': 'text/html; charset=utf-8' });
       // TelegramBot honours a remembered noindex as "no preview", so omit
       // X-Robots-Tag only for its .page fetches (case-insensitive UA sniff);
-      // browsers and search crawlers keep the noindex default. Locked notes
-      // never reach here (checkReadPassword 401s first), so previews leak
-      // nothing. Cache-Control: no-store is always kept.
+      // browsers and search crawlers keep the noindex default. The preview
+      // carries only the id-based title/description (crawlers do not run the
+      // loader JS, so no body excerpt is possible). Cache-Control: no-store
+      // is always kept.
       if (/telegrambot/i.test(userAgent)) delete headers['X-Robots-Tag'];
       return new Response(
-        renderPageView(row.id, text, { createdAt: row.created_at, updatedAt: row.updated_at }, origin),
+        renderPageView(row.id, { createdAt: row.created_at, updatedAt: row.updated_at }, origin),
         { headers },
       );
     }
@@ -801,6 +805,26 @@ function modeResponse(loaded, mode, extra) {
 
 async function handleGet(request, env, ctx, id, mode) {
   const url = new URL(request.url);
+  if (mode === 'page') {
+    // Shell-only path: existence check only, no body BLOB is fetched or
+    // decompressed. Missing notes keep the `.txt` semantics (XHR 404 for the
+    // loader, 302 back to the editor for a direct navigation). Locked notes
+    // get the same empty shell (200); the loader fetches `.txt` and prompts
+    // for the password on 401, mirroring the editor flow.
+    let found = await loadNoteMeta(env, id);
+    if (found && found.expired) {
+      ctx.waitUntil(deleteNote(env, id));
+      found = null;
+    }
+    if (!found) {
+      if (request.headers.get('X-Requested-With') === 'XMLHttpRequest') return notFound();
+      return redirect('/' + id);
+    }
+    return modeResponse({ row: found.row, text: '' }, mode, {
+      origin: url.origin,
+      userAgent: request.headers.get('user-agent') || '',
+    });
+  }
   if (mode) {
     let loaded = await loadNote(env, id);
     if (loaded && loaded.expired) {
@@ -2061,286 +2085,39 @@ main {
 }
 
 // ---------------------------------------------------------------------------
-// Markdown page view (`.page` suffix; rendered with markdown-it)
+// Markdown page shell (`.page` suffix; body rendered in the browser)
 // ---------------------------------------------------------------------------
 
-/** Hard cap on Markdown input length so hostile input stays cheap to render. */
-const PAGE_MAX_CHARS = 1000000;
-
 /**
- * Decode HTML entities back to characters for URL-scheme checks, so
- * `javascript&#58;...` cannot smuggle a dangerous scheme past the filter.
+ * Empty read-only shell for `.page` in a minimal Telegraph-like frame:
+ * centred 732px column, header (title + date), article, and a back-to-editor
+ * footer. The body is never rendered on the server: a small inline ES5 script
+ * (same XHR style as the editor — `XMLHttpRequest` with `X-Requested-With`,
+ * so a missing note reads as 404) fetches `/<id>.txt` and renders Markdown
+ * to HTML in the browser with a tiny zero-dependency renderer (a few KB raw,
+ * fully offline — no CDN, no SRI pin to maintain, no extra request).
+ *
+ * Password reuse: the loader mirrors the editor flow — the stored
+ * `localStorage` password first, then `?pw=`, then one `prompt()` retry on
+ * 401. A 401 never renders body text, only a "protected" placeholder.
+ * `meta` takes `{ createdAt, updatedAt }` (a notes row with `created_at` /
+ * `updated_at` works too); `origin` builds the absolute og:url. The title
+ * and description fall back to the note id: crawlers (Telegram included) do
+ * not run the loader JS, so no body excerpt can be offered server-side
+ * without rendering the body there. `text` is accepted as a legacy second
+ * argument and ignored.
  */
-function decodeEntitiesForCheck(value) {
-  return String(value)
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&#x([0-9a-f]+);?/gi, (m, hex) => String.fromCharCode(parseInt(hex, 16)))
-    .replace(/&#(\d+);?/g, (m, dec) => String.fromCharCode(parseInt(dec, 10)));
-}
-
-/**
- * True when the (possibly entity-encoded, padded) URL uses a dangerous
- * scheme: javascript:, data:, vbscript:, or file:. Comparison is done after
- * entity decoding and after trimming leading spaces/control characters, so
- * case, spacing, and encoding tricks do not slip through.
- */
-function hasDangerousScheme(url) {
-  const cleaned = decodeEntitiesForCheck(url).replace(/^[\s\x00-\x20]+/, '').toLowerCase();
-  return /^(javascript|data|vbscript|file)\s*:/.test(cleaned);
-}
-
-/**
- * True for a raw link target we keep: only http, https, or mailto. Anything
- * else (relative URLs included) degrades to plain text.
- */
-function isSafeHrefRaw(href) {
-  const clean = String(href).trim();
-  if (!clean) return false;
-  if (hasDangerousScheme(clean)) return false;
-  const decoded = decodeEntitiesForCheck(clean).replace(/^[\s\x00-\x20]+/, '');
-  return /^(https?:|mailto:)/i.test(decoded);
-}
-
-/**
- * True for a raw image source we keep: http, https, or a relative path. Any
- * other scheme (or a protocol-relative `//host/...`) drops the image.
- */
-function isSafeImgSrcRaw(src) {
-  const clean = String(src).trim();
-  if (!clean) return false;
-  if (hasDangerousScheme(clean)) return false;
-  const decoded = decodeEntitiesForCheck(clean).replace(/^[\s\x00-\x20]+/, '');
-  if (/^\/\//.test(decoded)) return false;
-  const scheme = decoded.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
-  if (scheme) return /^(https?)$/i.test(scheme[1]);
-  return true;
-}
-
-/**
- * Shared markdown-it instance for `.page`. `html:false` turns raw HTML
- * (iframe/video/script/img-onerror) into escaped text; `linkify:false` keeps
- * bare URLs unlinked; tables are disabled so they degrade to plain-text
- * paragraphs instead of 404ing.
- */
-const pageMd = new MarkdownIt({ html: false, linkify: false, typographer: false, breaks: false });
-pageMd.disable('table');
-// Identity link normalization: the default encodes URLs via mdurl/punycode
-// (see markdown-it#945) and would rewrite hrefs before we see them. Scheme
-// safety is enforced by our own render rules below, so keep the raw href.
-pageMd.normalizeLink = function (url) { return url; };
-// Accept every link at parse time; bad protocols degrade to label text in
-// link_open/link_close instead of leaking back as `[t](u)` source text.
-pageMd.validateLink = function () { return true; };
-
-/** Map a heading level onto the Telegraph scale (h1 never survives: see below). */
-function pageHeadingTag(level) {
-  if (level <= 2) return 'h2';
-  if (level === 3) return 'h3';
-  return 'h4';
-}
-
-function pageRemapHeading(tokens, idx, options) {
-  tokens[idx].tag = pageHeadingTag(Number(tokens[idx].tag.slice(1)));
-  return pageMd.renderer.renderToken(tokens, idx, options);
-}
-
-// The first h1 is consumed as the page title (markdownToHtml splices its
-// tokens out); any later h1 degrades to h2, h2 stays h2, h3 stays h3,
-// h4 and deeper become h4.
-pageMd.renderer.rules.heading_open = pageRemapHeading;
-pageMd.renderer.rules.heading_close = pageRemapHeading;
-
-// Fenced and indented code: drop the language hint, escape the raw content.
-function pageCodeBlock(tokens, idx) {
-  return '<pre><code>' + escapeHtml(tokens[idx].content) + '</code></pre>\n';
-}
-pageMd.renderer.rules.fence = pageCodeBlock;
-pageMd.renderer.rules.code_block = pageCodeBlock;
-
-// Links: only http/https/mailto survive. Anything else (javascript:, data:,
-// vbscript:, file:, relative URLs) degrades to its label text: both tags are
-// suppressed via the env counter while children render normally. Survivors
-// keep only href (+rel) — any title attribute is dropped.
-pageMd.renderer.rules.link_open = function (tokens, idx, options, env) {
-  const href = tokens[idx].attrGet('href') || '';
-  if (!isSafeHrefRaw(href)) {
-    env.badLinkDepth = (env.badLinkDepth || 0) + 1;
-    return '';
-  }
-  tokens[idx].attrs = [['href', String(href).trim()], ['rel', 'noopener']];
-  return pageMd.renderer.renderToken(tokens, idx, options);
-};
-pageMd.renderer.rules.link_close = function (tokens, idx, options, env) {
-  if (env.badLinkDepth > 0) {
-    env.badLinkDepth -= 1;
-    return '';
-  }
-  return pageMd.renderer.renderToken(tokens, idx, options);
-};
-
-// Images: only src/alt/loading are ever emitted (no title, no event-handler
-// attributes). An unsafe src drops the image entirely.
-pageMd.renderer.rules.image = function (tokens, idx, options, env) {
-  const tok = tokens[idx];
-  const src = tok.attrGet('src') || '';
-  if (!isSafeImgSrcRaw(src)) return '';
-  const alt = escapeHtml(pageMd.renderer.renderInlineAsText(tok.children || [], options, env));
-  return '<img src="' + escapeHtml(String(src).trim()) + '" alt="' + alt + '" loading="lazy">';
-};
-
-/**
- * A paragraph holding nothing but one image (ignoring blank text and line
- * breaks), or null. Used to wrap lone images in figure/figcaption.
- */
-function pageSingleImage(tokens, idx) {
-  const inline = tokens[idx + 1];
-  if (!inline || inline.type !== 'inline' || !inline.children) return null;
-  const kids = inline.children.filter(function (t) {
-    return !(
-      (t.type === 'text' && /^\s*$/.test(t.content)) ||
-      t.type === 'softbreak' ||
-      t.type === 'hardbreak'
-    );
-  });
-  if (kids.length === 1 && kids[0].type === 'image') return kids[0];
-  return null;
-}
-
-pageMd.renderer.rules.paragraph_open = function (tokens, idx, options, env) {
-  // Tight-list paragraphs are hidden: render nothing, like the default rule
-  // (renderToken does this automatically; this custom rule must do it here).
-  // Figures therefore only ever wrap top-level lone images.
-  if (tokens[idx].hidden) return '';
-  const img = pageSingleImage(tokens, idx);
-  if (!img) return '<p>';
-  if (!isSafeImgSrcRaw(img.attrGet('src') || '')) {
-    env.figureDrop = true;
-    return '';
-  }
-  env.figureAlt = pageMd.renderer.renderInlineAsText(img.children || [], options, env);
-  env.figureOpen = true;
-  return '<figure>';
-};
-
-pageMd.renderer.rules.paragraph_close = function (tokens, idx, options, env) {
-  if (tokens[idx].hidden) return '';
-  if (env.figureDrop) {
-    env.figureDrop = false;
-    return '';
-  }
-  if (env.figureOpen) {
-    env.figureOpen = false;
-    const cap = env.figureAlt !== undefined && /\S/.test(env.figureAlt)
-      ? '<figcaption>' + escapeHtml(env.figureAlt) + '</figcaption>'
-      : '';
-    env.figureAlt = undefined;
-    return cap + '</figure>\n';
-  }
-  return '</p>\n';
-};
-
-/**
- * Find the source line of the page title: the first `# ` heading (exactly
- * one `#`) outside fenced code. Mirrors the old hand-rolled rule so title
- * selection does not drift.
- */
-function findPageTitleLine(lines) {
-  let fenced = false;
-  for (let k = 0; k < lines.length; k++) {
-    if (/^\s{0,3}```/.test(lines[k])) {
-      fenced = !fenced;
-      continue;
-    }
-    if (fenced) continue;
-    const tm = lines[k].match(/^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$/);
-    if (tm && tm[1] === '#' && /\S/.test(tm[2])) return k;
-  }
-  return -1;
-}
-
-/** Truncate to n Unicode code points, appending … when cut. */
-function truncateCodePoints(s, n) {
-  const points = [...String(s)];
-  if (points.length <= n) return String(s);
-  return points.slice(0, n).join('') + '…';
-}
-
-/** Collapse all whitespace runs to single spaces and trim. */
-function collapseWhitespace(s) {
-  return String(s).replace(/\s+/g, ' ').trim();
-}
-
-/**
- * Reduce our own safe article/title HTML back to preview plain text:
- * images contribute their alt text, every other tag contributes its words.
- * Tags can only be our whitelist (plus markdown-it defaults: strong, em,
- * s, code, pre, a, blockquote, ul/ol/li, br, hr, table-free), so stripping
- * them is safe.
- */
-function htmlToPlain(html) {
-  return String(html)
-    .replace(/<img\b[^>]*\balt="([^"]*)"[^>]*>/gi, ' $1 ')
-    .replace(/<[^>]*>/g, ' ');
-}
-
-/**
- * Render a note body to a Telegraph-style fragment. Returns
- * `{ title, html }`: `title` is safe inline HTML for the page header (''
- * when the note has no `# ` heading), `html` is the article fragment.
- * markdown-it emits only its default tags here (p, h1-h6 remapped to
- * h2-h4, strong, em, s, code, pre, blockquote, ul, ol, li, br, hr, a,
- * img, figure, figcaption); raw HTML from the note stays escaped text.
- */
-export function markdownToHtml(source) {
-  let text = String(source == null ? '' : source);
-  if (text.length > PAGE_MAX_CHARS) text = text.slice(0, PAGE_MAX_CHARS);
-  const env = {};
-  const tokens = pageMd.parse(text, env);
-  // Consume the title's token triple so it never renders in the body.
-  const titleLine = findPageTitleLine(text.replace(/\r\n?/g, '\n').split('\n'));
-  let titleHtml = '';
-  if (titleLine !== -1) {
-    for (let k = 0; k + 2 < tokens.length; k++) {
-      if (
-        tokens[k].type === 'heading_open' &&
-        tokens[k + 1].type === 'inline' &&
-        tokens[k + 2].type === 'heading_close' &&
-        tokens[k + 1].map &&
-        tokens[k + 1].map[0] === titleLine
-      ) {
-        titleHtml = pageMd.renderer.render(tokens[k + 1].children, pageMd.options, {});
-        tokens.splice(k, 3);
-        break;
-      }
-    }
-  }
-  return { title: titleHtml, html: pageMd.renderer.render(tokens, pageMd.options, env) };
-}
-
-/**
- * Full read-only note page in a minimal Telegraph-like frame: centred column,
- * header (title + date), article, and a back-to-editor footer, plus
- * server-rendered share-preview meta (Telegram shows it without running JS).
- * Zero JavaScript, zero external fonts/CSS/JS; styling is one small inline
- * block. `meta` takes `{ createdAt, updatedAt }` (a notes row with
- * `created_at` / `updated_at` works too); `origin` (e.g. request.url's
- * origin) builds the absolute og:url and is omitted when unknown. The title
- * falls back to the note id, the description to `Web Notepad — {id}`.
- */
-export function renderPageView(id, text, meta, origin) {
+export function renderPageView(id, textOrMeta, metaOrOrigin, maybeOrigin) {
   const safeId = String(id == null ? '' : id);
-  const parsed = markdownToHtml(text);
-  const titleHtml = parsed.title || escapeHtml(safeId);
-  // Preview plain text: strip our own safe markup (images give alt text),
-  // collapse whitespace, then truncate by code points — never raw Markdown.
-  const plainTitle = truncateCodePoints(collapseWhitespace(htmlToPlain(parsed.title)), 80) || safeId;
-  const bodyHtml = parsed.html || '<p class="empty">Empty note.</p>';
-  const plainDesc = truncateCodePoints(collapseWhitespace(htmlToPlain(parsed.html)), 160) ||
-    'Web Notepad — ' + safeId;
+  let meta = {};
+  let origin = '';
+  if (textOrMeta && typeof textOrMeta === 'object') {
+    meta = textOrMeta;
+    origin = metaOrOrigin || '';
+  } else {
+    meta = metaOrOrigin || {};
+    origin = maybeOrigin || '';
+  }
   const m = meta || {};
   const createdAt = m.createdAt !== undefined ? m.createdAt : m.created_at;
   const updatedAt = m.updatedAt !== undefined ? m.updatedAt : m.updated_at;
@@ -2348,6 +2125,7 @@ export function renderPageView(id, text, meta, origin) {
   const addressHtml = stamp != null
     ? '<address>' + escapeHtml(formatUtc(stamp)) + '</address>'
     : '';
+  const plainDesc = 'Web Notepad — ' + safeId;
   let createdISO = '';
   let updatedISO = '';
   try {
@@ -2367,9 +2145,9 @@ export function renderPageView(id, text, meta, origin) {
     + '<html lang="en">\n'
     + '<head>\n'
     + '<meta charset="utf-8">\n'
-    + '<title>' + escapeHtml(plainTitle) + '</title>\n'
+    + '<title>' + escapeHtml(safeId) + '</title>\n'
     + '<meta name="description" content="' + escapeHtml(plainDesc) + '">\n'
-    + '<meta property="og:title" content="' + escapeHtml(plainTitle) + '">\n'
+    + '<meta property="og:title" content="' + escapeHtml(safeId) + '">\n'
     + '<meta property="og:description" content="' + escapeHtml(plainDesc) + '">\n'
     + '<meta property="og:type" content="article">\n'
     + (createdISO ? '<meta property="article:published_time" content="' + createdISO + '">\n' : '')
@@ -2403,6 +2181,10 @@ export function renderPageView(id, text, meta, origin) {
     + '.content figure img{margin:0 auto}\n'
     + '.content figcaption{font-size:15px;color:#79828B;margin-top:8px;padding:0 21px}\n'
     + '.content hr{border:none;border-top:1px solid #c9cdd1;width:50%;margin:24px auto}\n'
+    + '.content table{margin:0 21px 16px;border-collapse:collapse;width:calc(100% - 42px);display:block;overflow-x:auto}\n'
+    + '.content th,.content td{border:1px solid #ddd;padding:8px 12px;text-align:left;font-size:16px;overflow-wrap:break-word}\n'
+    + '.content th{background:#F5F8FC;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-weight:700}\n'
+    + '.content tbody tr:nth-child(even) td{background:#fafbfc}\n'
     + '.content .empty{color:#79828B;font-style:italic}\n'
     + 'footer{margin:32px 21px 0;font-size:15px;color:#79828B;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}\n'
     + 'footer a{color:inherit}\n'
@@ -2413,105 +2195,352 @@ export function renderPageView(id, text, meta, origin) {
     + '<div class="wrap">\n'
     + '<main>\n'
     + '<header>\n'
-    + '<h1>' + titleHtml + '</h1>\n'
+    + '<h1 id="page-title">' + escapeHtml(safeId) + '</h1>\n'
     + addressHtml + (addressHtml ? '\n' : '')
     + '</header>\n'
-    + '<article class="content">\n'
-    + bodyHtml + '\n'
+    + '<article class="content" id="page-content">\n'
+    + '<p class="empty">Loading…</p>\n'
     + '</article>\n'
     + '<footer><a href="/' + escapeHtml(safeId) + '">Edit this note</a></footer>\n'
     + '</main>\n'
     + '</div>\n'
+    + '<script>\n'
+    + '/* page loader: fetch the raw text, then render Markdown in the browser */\n'
+    + '(function () {\n'
+    + '"use strict";\n'
+    + 'var NOTE_ID = ' + JSON.stringify(safeId) + ';\n'
+    + 'var MAX_CHARS = 1000000;\n'
+    + 'var titleEl = document.getElementById("page-title");\n'
+    + 'var article = document.getElementById("page-content");\n'
+    + 'var notePw = "";\n'
+    + 'var pwFromUrl = false;\n'
+    + 'var pwPrompted = false;\n'
+    + 'function pwKey() { return "web-notepad-pw-" + NOTE_ID; }\n'
+    + 'function storePw(pw) { try { window.localStorage.setItem(pwKey(), pw); } catch (err) {} }\n'
+    + 'function clearStoredPw() { try { window.localStorage.removeItem(pwKey()); } catch (err) {} }\n'
+    + 'function queryPw() {\n'
+    + '    try {\n'
+    + '        var s = window.location.search || "";\n'
+    + '        if (s.charAt(0) === "?") s = s.slice(1);\n'
+    + '        var parts = s.split("&");\n'
+    + '        for (var i = 0; i < parts.length; i++) {\n'
+    + '            var kv = parts[i];\n'
+    + '            var eq = kv.indexOf("=");\n'
+    + '            var k = eq === -1 ? kv : kv.slice(0, eq);\n'
+    + '            if (k === "pw") {\n'
+    + '                var v = eq === -1 ? "" : kv.slice(eq + 1);\n'
+    + '                if (!v) return "";\n'
+    + '                try { return decodeURIComponent(v.split("+").join(" ")); } catch (err2) { return v; }\n'
+    + '            }\n'
+    + '        }\n'
+    + '    } catch (err) {}\n'
+    + '    return "";\n'
+    + '}\n'
+    + 'function stripQueryPw() {\n'
+    + '    pwFromUrl = false;\n'
+    + '    try {\n'
+    + '        if (window.history && window.history.replaceState) {\n'
+    + '            window.history.replaceState(null, "", "/" + NOTE_ID + ".page");\n'
+    + '        }\n'
+    + '    } catch (err) {}\n'
+    + '}\n'
+    + 'try { notePw = window.localStorage.getItem(pwKey()) || ""; } catch (err) { notePw = ""; }\n'
+    + 'var urlPw = queryPw();\n'
+    + 'if (!notePw && urlPw) { notePw = urlPw; pwFromUrl = true; }\n'
+    + 'function esc(s) {\n'
+    + '    return String(s).replace(/[&<>"\\x27]/g, function (c) {\n'
+    + '        if (c === "&") return "&amp;";\n'
+    + '        if (c === "<") return "&lt;";\n'
+    + '        if (c === ">") return "&gt;";\n'
+    + '        return c === "\\"" ? "&quot;" : "&#39;";\n'
+    + '    });\n'
+    + '}\n'
+    + 'function decEnt(s) {\n'
+    + '    return String(s).replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/&quot;/gi, "\\"").replace(/&#39;|&apos;/gi, "\\x27").replace(/&#x([0-9a-f]+);?/gi, function (m, hex) { return String.fromCharCode(parseInt(hex, 16)); }).replace(/&#(\\d+);?/g, function (m, dec) { return String.fromCharCode(parseInt(dec, 10)); });\n'
+    + '}\n'
+    + 'function badScheme(u) {\n'
+    + '    var c = decEnt(u).replace(/^[\\s\\x00-\\x20]+/, "").toLowerCase();\n'
+    + '    return /^(javascript|data|vbscript|file)\\s*:/.test(c);\n'
+    + '}\n'
+    + 'function safeHref(h) {\n'
+    + '    var clean = String(h).replace(/^\\s+|\\s+$/g, "");\n'
+    + '    if (!clean) return false;\n'
+    + '    if (badScheme(clean)) return false;\n'
+    + '    var d = decEnt(clean).replace(/^[\\s\\x00-\\x20]+/, "");\n'
+    + '    return /^(https?:|mailto:)/i.test(d);\n'
+    + '}\n'
+    + 'function safeImgSrc(s) {\n'
+    + '    var clean = String(s).replace(/^\\s+|\\s+$/g, "");\n'
+    + '    if (!clean) return false;\n'
+    + '    if (badScheme(clean)) return false;\n'
+    + '    var d = decEnt(clean).replace(/^[\\s\\x00-\\x20]+/, "");\n'
+    + '    if (d.slice(0, 2) === "//") return false;\n'
+    + '    var m = d.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);\n'
+    + '    if (m) return /^(https?)$/i.test(m[1]);\n'
+    + '    return true;\n'
+    + '}\n'
+    + 'function fmt(s) {\n'
+    + '    var t = String(s);\n'
+    + '    t = t.replace(/\\*\\*([^*]+)\\*\\*/g, "<strong>$1</strong>");\n'
+    + '    t = t.replace(/__([^_]+)__/g, "<strong>$1</strong>");\n'
+    + '    t = t.replace(/\\*([^*\\n]+)\\*/g, "<em>$1</em>");\n'
+    + '    t = t.replace(/(^|[^a-zA-Z0-9_])_([^_\\n]+)_/g, "$1<em>$2</em>");\n'
+    + '    t = t.replace(/~~([^~]+)~~/g, "<s>$1</s>");\n'
+    + '    return t;\n'
+    + '}\n'
+    + 'function inlineMd(s) {\n'
+    + '    var codes = [];\n'
+    + '    var tags = [];\n'
+    + '    var t = String(s).replace(/`([^`]+)`/g, function (m, code) { codes.push(code); return "\\x00" + (codes.length - 1) + "\\x00"; });\n'
+    + '    t = esc(t);\n'
+    + '    t = t.replace(/!\\[([^\\]]*)\\]\\(((?:[^()]*|\\([^()]*\\))*)\\)/g, function (m, alt, src) {\n'
+    + '        var raw = decEnt(src).replace(/^\\s+|\\s+$/g, "");\n'
+    + '        if (!safeImgSrc(raw)) return "";\n'
+    + '        tags.push("<img src=\\"" + esc(raw) + "\\" alt=\\"" + alt + "\\" loading=\\"lazy\\">");\n'
+    + '        return "\\x01" + (tags.length - 1) + "\\x01";\n'
+    + '    });\n'
+    + '    t = t.replace(/\\[([^\\]]*)\\]\\(((?:[^()]*|\\([^()]*\\))*)\\)/g, function (m, label, href) {\n'
+    + '        var raw = decEnt(href).replace(/^\\s+|\\s+$/g, "");\n'
+    + '        if (!safeHref(raw)) return label;\n'
+    + '        tags.push("<a href=\\"" + esc(raw) + "\\" rel=\\"noopener\\">" + fmt(label) + "</a>");\n'
+    + '        return "\\x01" + (tags.length - 1) + "\\x01";\n'
+    + '    });\n'
+    + '    t = fmt(t);\n'
+    + '    t = t.replace(/\\x01(\\d+)\\x01/g, function (m, k) { return tags[Number(k)]; });\n'
+    + '    t = t.replace(/\\x00(\\d+)\\x00/g, function (m, k) { return "<code>" + esc(codes[Number(k)]) + "</code>"; });\n'
+    + '    return t;\n'
+    + '}\n'
+    + 'function stripTags(s) { return String(s).replace(/<[^>]*>/g, " "); }\n'
+    + 'function collapseWs(s) { return String(s).replace(/\\s+/g, " ").replace(/^\\s+|\\s+$/g, ""); }\n'
+    + 'function findTitle(lines) {\n'
+    + '    var fenced = false;\n'
+    + '    for (var k = 0; k < lines.length; k++) {\n'
+    + '        if (/^\\s{0,3}```/.test(lines[k])) { fenced = !fenced; continue; }\n'
+    + '        if (fenced) continue;\n'
+    + '        var tm = lines[k].match(/^\\s{0,3}(#{1,6})\\s+(.*?)(?:\\s+#+)?\\s*$/);\n'
+    + '        if (tm && tm[1] === "#" && /\\S/.test(tm[2])) return k;\n'
+    + '    }\n'
+    + '    return -1;\n'
+    + '}\n'
+    + 'function headTag(level) {\n'
+    + '    if (level <= 2) return "h2";\n'
+    + '    if (level === 3) return "h3";\n'
+    + '    return "h4";\n'
+    + '}\n'
+    + 'function splitTableRow(s) {\n'
+    + '    var t = String(s).replace(/^\\s+|\\s+$/g, "");\n'
+    + '    if (t.charAt(0) === "|") t = t.slice(1);\n'
+    + '    if (t.length && t.charAt(t.length - 1) === "|") t = t.slice(0, -1);\n'
+    + '    var cells = t.split("|");\n'
+    + '    for (var i = 0; i < cells.length; i++) cells[i] = cells[i].replace(/^\\s+|\\s+$/g, "").replace(/\\\\\\|/g, "|");\n'
+    + '    return cells;\n'
+    + '}\n'
+    + 'function isDelimRow(s) {\n'
+    + '    if (String(s).indexOf("|") === -1) return false;\n'
+    + '    var cells = splitTableRow(s);\n'
+    + '    if (!cells.length) return false;\n'
+    + '    for (var i = 0; i < cells.length; i++) { if (!/^:?-{1,}:?$/.test(cells[i].replace(/\\s+/g, ""))) return false; }\n'
+    + '    return true;\n'
+    + '}\n'
+    + 'function tableAlign(cell) {\n'
+    + '    var c = String(cell).replace(/\\s+/g, "");\n'
+    + '    var l = c.charAt(0) === ":";\n'
+    + '    var r = c.length > 1 && c.charAt(c.length - 1) === ":";\n'
+    + '    if (l && r) return "center";\n'
+    + '    if (r) return "right";\n'
+    + '    if (l) return "left";\n'
+    + '    return "";\n'
+    + '}\n'
+    + 'function renderMd(src) {\n'
+    + '    var text = String(src == null ? "" : src);\n'
+    + '    if (text.length > MAX_CHARS) text = text.slice(0, MAX_CHARS);\n'
+    + '    var lines = text.replace(/\\r\\n?/g, "\\n").split("\\n");\n'
+    + '    var titleLine = findTitle(lines);\n'
+    + '    var titleText = "";\n'
+    + '    var html = "";\n'
+    + '    var i = 0;\n'
+    + '    while (i < lines.length) {\n'
+    + '        var line = lines[i];\n'
+    + '        if (i === titleLine) {\n'
+    + '            var tm0 = line.match(/^\\s{0,3}#{1,6}\\s+(.*?)(?:\\s+#+)?\\s*$/);\n'
+    + '            titleText = collapseWs(stripTags(inlineMd(tm0 ? tm0[1] : "")));\n'
+    + '            i++;\n'
+    + '            continue;\n'
+    + '        }\n'
+    + '        if (/^\\s{0,3}```/.test(line)) {\n'
+    + '            var buf = [];\n'
+    + '            i++;\n'
+    + '            while (i < lines.length && !/^\\s{0,3}```/.test(lines[i])) { buf.push(lines[i]); i++; }\n'
+    + '            i++;\n'
+    + '            html += "<pre><code>" + esc(buf.join("\\n")) + "</code></pre>\\n";\n'
+    + '            continue;\n'
+    + '        }\n'
+    + '        var hm = line.match(/^\\s{0,3}(#{1,6})\\s+(.*?)(?:\\s+#+)?\\s*$/);\n'
+    + '        if (hm && /\\S/.test(hm[2])) {\n'
+    + '            var tag = headTag(hm[1].length);\n'
+    + '            html += "<" + tag + ">" + inlineMd(hm[2]) + "</" + tag + ">\\n";\n'
+    + '            i++;\n'
+    + '            continue;\n'
+    + '        }\n'
+    + '        if (/^(-{3,}|_{3,}|\\*{3,})$/.test(line.replace(/\\s+/g, ""))) {\n'
+    + '            html += "<hr>\\n";\n'
+    + '            i++;\n'
+    + '            continue;\n'
+    + '        }\n'
+    + '        var bq = line.match(/^\\s{0,3}>\\s?(.*)$/);\n'
+    + '        if (bq) {\n'
+    + '            var qb = [bq[1]];\n'
+    + '            i++;\n'
+    + '            while (i < lines.length && /^\\s{0,3}>\\s?/.test(lines[i])) { qb.push(lines[i].replace(/^\\s{0,3}>\\s?/, "")); i++; }\n'
+    + '            var qt = collapseWs(qb.join(" "));\n'
+    + '            if (/\\S/.test(qt)) html += "<blockquote><p>" + inlineMd(qt) + "</p></blockquote>\\n";\n'
+    + '            continue;\n'
+    + '        }\n'
+    + '        if (/^\\s{0,3}[-*+]\\s+\\S/.test(line)) {\n'
+    + '            html += "<ul>\\n";\n'
+    + '            while (i < lines.length && /^\\s{0,3}[-*+]\\s+\\S/.test(lines[i])) {\n'
+    + '                html += "<li>" + inlineMd(lines[i].replace(/^\\s{0,3}[-*+]\\s+/, "")) + "</li>\\n";\n'
+    + '                i++;\n'
+    + '            }\n'
+    + '            html += "</ul>\\n";\n'
+    + '            continue;\n'
+    + '        }\n'
+    + '        if (/^\\s{0,3}\\d+[.)]\\s+\\S/.test(line)) {\n'
+    + '            html += "<ol>\\n";\n'
+    + '            while (i < lines.length && /^\\s{0,3}\\d+[.)]\\s+\\S/.test(lines[i])) {\n'
+    + '                html += "<li>" + inlineMd(lines[i].replace(/^\\s{0,3}\\d+[.)]\\s+/, "")) + "</li>\\n";\n'
+    + '                i++;\n'
+    + '            }\n'
+    + '            html += "</ol>\\n";\n'
+    + '            continue;\n'
+    + '        }\n'
+    + '        if (line.indexOf("|") !== -1 && i + 1 < lines.length && isDelimRow(lines[i + 1])) {\n'
+    + '            var hcells = splitTableRow(line);\n'
+    + '            var dcells = splitTableRow(lines[i + 1]);\n'
+    + '            var aligns = [];\n'
+    + '            for (var ai = 0; ai < hcells.length; ai++) aligns.push(tableAlign(dcells[ai] || ""));\n'
+    + '            var rows = [];\n'
+    + '            i += 2;\n'
+    + '            while (i < lines.length && /\\S/.test(lines[i]) && lines[i].indexOf("|") !== -1) { rows.push(splitTableRow(lines[i])); i++; }\n'
+    + '            html += "<table>\\n<thead>\\n<tr>\\n";\n'
+    + '            for (var hi = 0; hi < hcells.length; hi++) {\n'
+    + '                var hal = aligns[hi] ? " align=\\"" + aligns[hi] + "\\"" : "";\n'
+    + '                html += "<th" + hal + ">" + inlineMd(hcells[hi]) + "</th>\\n";\n'
+    + '            }\n'
+    + '            html += "</tr>\\n</thead>\\n";\n'
+    + '            if (rows.length) {\n'
+    + '                html += "<tbody>\\n";\n'
+    + '                for (var ri = 0; ri < rows.length; ri++) {\n'
+    + '                    html += "<tr>\\n";\n'
+    + '                    for (var ci = 0; ci < hcells.length; ci++) {\n'
+    + '                        var cal = aligns[ci] ? " align=\\"" + aligns[ci] + "\\"" : "";\n'
+    + '                        html += "<td" + cal + ">" + inlineMd(rows[ri][ci] || "") + "</td>\\n";\n'
+    + '                    }\n'
+    + '                    html += "</tr>\\n";\n'
+    + '                }\n'
+    + '                html += "</tbody>\\n";\n'
+    + '            }\n'
+    + '            html += "</table>\\n";\n'
+    + '            continue;\n'
+    + '        }\n'
+    + '        if (/^(    |\\t)/.test(line)) {\n'
+    + '            var cb = [];\n'
+    + '            while (i < lines.length && (/^(    |\\t)/.test(lines[i]) || !/\\S/.test(lines[i]))) {\n'
+    + '                if (/\\S/.test(lines[i])) cb.push(lines[i].replace(/^(    |\\t)/, ""));\n'
+    + '                else cb.push("");\n'
+    + '                i++;\n'
+    + '            }\n'
+    + '            while (cb.length && cb[cb.length - 1] === "") cb.pop();\n'
+    + '            if (cb.length) html += "<pre><code>" + esc(cb.join("\\n")) + "</code></pre>\\n";\n'
+    + '            continue;\n'
+    + '        }\n'
+    + '        if (!/\\S/.test(line)) { i++; continue; }\n'
+    + '        var pb = [line.replace(/^\\s+|\\s+$/g, "")];\n'
+    + '        i++;\n'
+    + '        while (i < lines.length && i !== titleLine && /\\S/.test(lines[i]) && !/^\\s{0,3}(```|#{1,6}\\s|>|\\d+[.)]\\s+|[-*+]\\s+\\S)/.test(lines[i]) && !/^(    |\\t)/.test(lines[i]) && !(lines[i].indexOf("|") !== -1 && i + 1 < lines.length && isDelimRow(lines[i + 1]))) {\n'
+    + '            pb.push(lines[i].replace(/^\\s+|\\s+$/g, ""));\n'
+    + '            i++;\n'
+    + '        }\n'
+    + '        var ptext = pb.join(" ");\n'
+    + '        var lone = ptext.match(/^!\\[([^\\]]*)\\]\\(((?:[^()]*|\\([^()]*\\))*)\\)$/);\n'
+    + '        if (lone) {\n'
+    + '            var lsrc = lone[2].replace(/^\\s+|\\s+$/g, "");\n'
+    + '            if (safeImgSrc(lsrc)) {\n'
+    + '                var cap = /\\S/.test(lone[1]) ? "<figcaption>" + esc(lone[1]) + "</figcaption>" : "";\n'
+    + '                html += "<figure><img src=\\"" + esc(lsrc) + "\\" alt=\\"" + esc(lone[1]) + "\\" loading=\\"lazy\\">" + cap + "</figure>\\n";\n'
+    + '            }\n'
+    + '            continue;\n'
+    + '        }\n'
+    + '        html += "<p>" + inlineMd(ptext) + "</p>\\n";\n'
+    + '    }\n'
+    + '    if (!/\\S/.test(stripTags(html))) html = "<p class=\\"empty\\">Empty note.</p>\\n";\n'
+    + '    return { titleText: titleText, html: html };\n'
+    + '}\n'
+    + 'function setArticle(html) { article.innerHTML = html; }\n'
+    + 'function showLocked() { setArticle("<p class=\\"empty\\">This note is protected.</p>"); }\n'
+    + 'function load() {\n'
+    + '    var req = new XMLHttpRequest();\n'
+    + '    req.open("GET", "/" + NOTE_ID + ".txt", true);\n'
+    + '    req.setRequestHeader("X-Requested-With", "XMLHttpRequest");\n'
+    + '    if (notePw) req.setRequestHeader("X-Note-Password", notePw);\n'
+    + '    req.onreadystatechange = function () {\n'
+    + '        if (req.readyState !== 4) return;\n'
+    + '        var status = req.status;\n'
+    + '        if (status === 200) {\n'
+    + '            var ct = req.getResponseHeader("Content-Type") || "";\n'
+    + '            if (ct.indexOf("text/html") !== -1) {\n'
+    + '                setArticle("<p class=\\"empty\\">Empty note.</p>");\n'
+    + '                return;\n'
+    + '            }\n'
+    + '            var fetched = req.responseText;\n'
+    + '            if (notePw) storePw(notePw);\n'
+    + '            if (pwFromUrl) stripQueryPw();\n'
+    + '            var out;\n'
+    + '            try {\n'
+    + '                out = renderMd(fetched);\n'
+    + '            } catch (err) {\n'
+    + '                article.innerHTML = "";\n'
+    + '                var pre = document.createElement("pre");\n'
+    + '                pre.appendChild(document.createTextNode(fetched));\n'
+    + '                article.appendChild(pre);\n'
+    + '                return;\n'
+    + '            }\n'
+    + '            if (out.titleText) {\n'
+    + '                titleEl.textContent = out.titleText;\n'
+    + '                try { document.title = out.titleText; } catch (err2) {}\n'
+    + '            }\n'
+    + '            setArticle(out.html);\n'
+    + '        } else if (status === 404) {\n'
+    + '            setArticle("<p class=\\"empty\\">Empty note.</p>");\n'
+    + '        } else if (status === 401) {\n'
+    + '            notePw = "";\n'
+    + '            clearStoredPw();\n'
+    + '            if (!pwPrompted) {\n'
+    + '                pwPrompted = true;\n'
+    + '                var attempt = null;\n'
+    + '                try { attempt = window.prompt("This note is protected. Enter the password:", ""); } catch (err) { attempt = null; }\n'
+    + '                if (attempt !== null && attempt !== "") {\n'
+    + '                    notePw = attempt;\n'
+    + '                    load();\n'
+    + '                    return;\n'
+    + '                }\n'
+    + '            }\n'
+    + '            showLocked();\n'
+    + '        } else {\n'
+    + '            setArticle("<p class=\\"empty\\">Could not load the note.</p>");\n'
+    + '        }\n'
+    + '    };\n'
+    + '    req.onerror = function () {\n'
+    + '        setArticle("<p class=\\"empty\\">Could not load the note.</p>");\n'
+    + '    };\n'
+    + '    req.send(null);\n'
+    + '}\n'
+    + 'load();\n'
+    + '})();\n'
+    + '</script>\n'
     + '</body>\n'
     + '</html>';
 }
-
-
-// ---------------------------------------------------------------------------
-// Instance skill doc (/SKILLS.md)
-// ---------------------------------------------------------------------------
-
-/** Usage doc served by this instance at GET /SKILLS.md. */
-export function skillsDoc(origin) {
-  const base = origin || 'BASE';
-  return ('# Web Notepad Skills\n'
-  + '\n'
-  + 'This file explains how to use this Web Notepad instance.\n'
-  + 'The base URL below is the host that serves this file.\n'
-  + '\n'
-  + '## Save a note\n'
-  + '\n'
-  + 'Browser: open / and type. The page saves on its own.\n'
-  + 'Pick any ID: open /my-note and type. An empty save deletes the note.\n'
-  + '\n'
-  + 'CLI (curl or wget user agent):\n'
-  + '\n'
-  + 'echo hello | curl --data-binary @- BASE/my-note\n'
-  + 'echo hello | curl --data-binary @- BASE/   # new random ID, receipt shows it\n'
-  + '\n'
-  + 'A save prints a receipt with Note, Saved, Expires, and read URLs.\n'
-  + '\n'
-  + '## Read a note\n'
-  + '\n'
-  + 'curl BASE/my-note            # raw text (curl/wget only)\n'
-  + 'curl BASE/my-note.txt        # plain text\n'
-  + 'curl BASE/my-note.base64     # Base64\n'
-  + 'curl BASE/my-note.page       # Markdown page (HTML)\n'
-  + '\n'
-  + 'Browsers open /my-note and get the editor.\n'
-  + '\n'
-  + '## Output modes\n'
-  + '\n'
-  + 'Three spellings, first match wins: suffix, second path part, ?mode=.\n'
-  + '\n'
-  + '/my-note.txt = plain, /my-note.base64 = base64, /my-note.page = page.\n'
-  + '/my-note/plain, /my-note/mtime, /my-note/html, /my-note/css,\n'
-  + '/my-note/js, /my-note/json, /my-note/page.\n'
-  + '/my-note?mode=page\n'
-  + '\n'
-  + 'mtime = updated_at as unix seconds. html/css/js/json = body as that type.\n'
-  + 'An unknown suffix (for example /index.jsp) returns 400.\n'
-  + '\n'
-  + '## .page\n'
-  + '\n'
-  + '/my-note.page renders Markdown to a plain article page (no JS).\n'
-  + 'The first "# Title" line becomes the page title.\n'
-  + 'The page head has og:title and og:description, so a link\n'
-  + 'shared to Telegram shows a text preview.\n'
-  + '\n'
-  + '## Append\n'
-  + '\n'
-  + 'echo " world" | curl --data-binary @- BASE/my-note/append\n'
-  + '\n'
-  + '## Expiry\n'
-  + '\n'
-  + 'Tokens: 24h, 72h, 1w, never. New notes live 30 days by default.\n'
-  + '\n'
-  + 'curl -d \'expires=24h\' BASE/my-note/expire\n'
-  + 'curl -d \'expires=never\' BASE/my-note/expire\n'
-  + '\n'
-  + 'A raw-body CLI save keeps the current expiry.\n'
-  + '\n'
-  + '## Password lock\n'
-  + '\n'
-  + 'curl -d \'new=secret\' BASE/my-note/password\n'
-  + 'curl -H \'X-Note-Password: secret\' BASE/my-note.txt\n'
-  + 'curl \'BASE/my-note.txt?pw=secret\'\n'
-  + '\n'
-  + 'Reads take the header or ?pw=. Writes take only the header.\n'
-  + 'A missing or wrong password returns 401.\n'
-  + 'Change: curl -d \'current=secret&new=other\' BASE/my-note/password\n'
-  + 'Remove: curl -d \'current=secret&new=\' BASE/my-note/password\n'
-  + '\n'
-  + '## IDs and limits\n'
-  + '\n'
-  + 'IDs use a-z A-Z 0-9 _ -, any length.\n'
-  + 'Every response is no-store and noindex.\n'
-  + 'Browser form saves need the page CSRF token (blind POST = 403).\n'
-  + 'Raw writes need a curl or wget user agent.\n'
-  + '').split('BASE').join(base);
-}
-
 
 // ---------------------------------------------------------------------------
 // Worker entrypoint
@@ -2532,14 +2561,6 @@ export default {
         return handlePost(request, env, ctx, await freshNoteId(env), '');
       }
       return redirect('/' + randomNoteId());
-    }
-
-    // Instance skill doc: exact match only, no note lookup, no password gate.
-    if (segments.length === 1 && segments[0] === 'SKILLS.md') {
-      if (request.method !== 'GET' && request.method !== 'HEAD') return notFound();
-      return new Response(skillsDoc(url.origin), {
-        headers: noStore({ 'Content-Type': 'text/markdown; charset=utf-8' }),
-      });
     }
 
     // Output is addressed by file suffix: /<id>.txt, /<id>.base64, /<id>.page.
