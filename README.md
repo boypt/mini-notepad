@@ -136,6 +136,76 @@ curl -d 'current=secret&new=' https://<your-worker>/my-note/password
 In the browser, click the lock button in the status bar. The browser asks
 for the password one time and remembers it for that note.
 
+## MCP (AI assistant access)
+
+An AI assistant can read and write notes through MCP
+(Model Context Protocol). The endpoint is:
+
+```text
+https://<your-worker>/mcp
+```
+
+It uses Streamable HTTP. It has no login. Any client that can reach the URL
+can use it. A locked note still needs its password, passed as a tool
+argument.
+
+Six tools:
+
+| Tool | What it does |
+| --- | --- |
+| `read_note` | Reads a note. Long notes are cut (default 25000 chars). |
+| `write_note` | Creates or replaces a note. No `id` makes a new random ID. |
+| `append_note` | Adds text to the end of a note. |
+| `delete_note` | Deletes a note forever. |
+| `set_expiry` | Changes only the expiry (`24h`, `72h`, `1w`, `never`). |
+| `set_password` | Sets, changes, or removes the note password. |
+
+Add it to your client. You only need the URL. No headers, no keys.
+
+Cursor, VS Code, and Claude Desktop use `mcp-remote`:
+
+```json
+{
+  "mcpServers": {
+    "web-notepad": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://<your-worker>/mcp"]
+    }
+  }
+}
+```
+
+Claude Code CLI:
+
+```sh
+claude mcp add --transport http web-notepad https://<your-worker>/mcp
+```
+
+### Teach your agent to use it
+
+After the client is set up, paste this to your agent. It tells the
+agent when and how to use the six tools:
+
+```text
+You can save and read text notes on my Web Notepad
+at https://<your-worker>/mcp. Use its MCP tools:
+
+- read_note when I ask to open, show, or fetch a saved note.
+  Long notes are cut at 25000 chars; read again with a
+  bigger maxChars when I need the rest.
+- write_note to save or replace a note. Omit id for a new
+  random id. An empty text deletes the note.
+- append_note to add text to the end without replacing.
+- delete_note only when I clearly ask to delete.
+- set_expiry to change only the expiry: 24h, 72h, 1w, or never.
+- set_password to lock, unlock, or change a note password.
+
+Rules: note ids use a-z, A-Z, 0-9, _ and -.
+A locked note needs its password argument; without it the
+tool fails with a hint. There is no list of notes: ask me
+for the id when you do not know it.
+```
+
 ## Routes (reference)
 
 | Route | What it does |
@@ -150,6 +220,7 @@ for the password one time and remembers it for that note.
 | `POST /:note` (raw body) | CLI save. |
 | `POST /:note/append` (raw body) | CLI append. |
 | `POST /` (raw body) | CLI save to a new random ID. |
+| `POST /mcp` | MCP tools (JSON-RPC). See [MCP](#mcp-ai-assistant-access). |
 
 Notes:
 

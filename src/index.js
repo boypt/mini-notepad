@@ -28,8 +28,18 @@
  *   - POST /:note/append         -> CLI append
  *   - POST /       (CLI)         -> CLI save to a new random id; receipt shows id
  *   - CLI user-agent             -> raw body, no HTML wrapper
+ *   - POST /mcp                  -> MCP (Streamable HTTP, stateless, no auth);
+ *                                    JSON-RPC tools: read_note, write_note,
+ *                                    append_note, delete_note, set_expiry,
+ *                                    set_password
+ *   - GET/DELETE /mcp            -> 405
  *
  * Security:
+ *   - The MCP endpoint has no authentication (same as the public notebook).
+ *     To add an API key later, check a header in mcpAuthHook and return 401;
+ *     tool handlers stay unchanged. MCP tools skip the browser CSRF and CLI
+ *     user-agent checks (there is no browser); a locked note still needs its
+ *     password, passed as a tool argument instead of a header.
  *   - A browser form save must carry the per-note CSRF token from the page.
  *   - A raw CLI write is allowed only for whitelisted user agents (curl, wget).
  *   - GET /:note returns only the empty shell (meta/csrf, no body text);
@@ -73,6 +83,8 @@
 import zlib from 'node:zlib';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { Buffer } from 'node:buffer';
+import { McpServer, WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/server';
+import { z } from 'zod';
 
 const NOTE_ID_RE = /^[a-zA-Z0-9_-]+$/;
 const MODE_RE = /^[a-z0-9]*$/;
@@ -2440,12 +2452,522 @@ export function renderPageView(id, textOrMeta, metaOrOrigin, maybeOrigin) {
 }
 
 // ---------------------------------------------------------------------------
+// MCP (Model Context Protocol) — Streamable HTTP, stateless, no auth
+//
+//   POST /mcp          -> JSON-RPC handled here (one fresh McpServer plus one
+//                         fresh transport per request, never reused)
+//   GET /mcp, DELETE /mcp -> 405
+//
+// Six tools (all snake_case): read_note, write_note, append_note,
+// delete_note, set_expiry, set_password. Tools reuse the note store above
+// (loadNote / loadNoteMeta / saveNote / deleteNote / setNoteExpiry /
+// setNotePassword / verifyPassword / isProtectedRow) and mirror the HTTP
+// route semantics: expired notes read as missing, locked notes need their
+// password (passed as a tool argument), an empty write deletes, and only an
+// unlocked note can be locked in one step. No note listing, no .page/editor
+// HTML, no Resources/Prompts, no .well-known/OAuth, no Durable Objects.
+// ---------------------------------------------------------------------------
+
+/**
+ * Auth choke point for the MCP endpoint. It currently allows every request:
+ * this service ships without authentication, like the public notebook.
+ * To add an API key later, check a header here and return a 401 Response
+ * (about ten lines of middleware); return null to allow. Tool handlers
+ * below stay unchanged.
+ */
+function mcpAuthHook(request) {
+  return null;
+}
+
+/** Note id rule shared by every MCP tool (same as NOTE_ID_RE). */
+const MCP_NOTE_ID_RE = /^[A-Za-z0-9_-]+$/;
+/** Default and upper bound for read_note maxChars (in text characters). */
+const MCP_DEFAULT_MAX_CHARS = 25000;
+const MCP_MAX_CHARS_LIMIT = 1000000;
+
+const mcpIdInput = z
+  .string()
+  .regex(MCP_NOTE_ID_RE, 'Note id may only use a-z, A-Z, 0-9, _ and -.')
+  .describe('Note id. Only a-z, A-Z, 0-9, _ and - are allowed.');
+const mcpPasswordInput = z
+  .string()
+  .default('')
+  .describe(
+    'Note password. Needed only when the note is locked with a password; leave it empty for a public note.',
+  );
+const mcpStamp = (name) =>
+  z
+    .number()
+    .nullable()
+    .describe(`${name}, as milliseconds since the Unix epoch, or null when never.`);
+
+/** Success result: human-readable text plus machine-readable structured data. */
+function mcpOk(text, structuredContent) {
+  return { content: [{ type: 'text', text }], structuredContent };
+}
+
+/** Tool-level failure (missing note, wrong password, bad id): never throws. */
+function mcpFail(text) {
+  return { content: [{ type: 'text', text }], isError: true };
+}
+
+function mcpMissingText(id) {
+  return (
+    `Note '${id}' was not found. ` +
+    'It may never have existed, or it may have expired and been deleted.'
+  );
+}
+
+function mcpLockedText(id) {
+  return `Note '${id}' is locked with a password. Call again with the 'password' argument.`;
+}
+
+function mcpWrongPasswordText(id) {
+  return `Wrong password for note '${id}'. Nothing changed.`;
+}
+
+/**
+ * Build a fresh McpServer with the six note tools bound to this request's
+ * env/ctx. Called once per HTTP request; the instance is never reused.
+ */
+function createMcpServer(env, ctx) {
+  const server = new McpServer({ name: 'web-notepad', version: '1.0.0' });
+
+  server.registerTool(
+    'read_note',
+    {
+      title: 'Read note',
+      description:
+        'Read a saved note by id. Use when the user wants to open, read, show, or fetch a note. ' +
+        'A locked note needs its password in the password argument; without it the call fails with a hint instead of the text. ' +
+        'Long notes are cut at maxChars; the result tells you how to read the rest.',
+      inputSchema: z.object({
+        id: mcpIdInput,
+        format: z
+          .enum(['text', 'base64'])
+          .default('text')
+          .describe("Output shape: 'text' for plain text, 'base64' for Base64 of the UTF-8 text."),
+        password: mcpPasswordInput,
+        maxChars: z
+          .number()
+          .int()
+          .min(1)
+          .max(MCP_MAX_CHARS_LIMIT)
+          .default(MCP_DEFAULT_MAX_CHARS)
+          .describe(
+            'Longest text to return, in characters. Longer notes are cut and marked truncated:true; ' +
+              'call again with a bigger maxChars to read the rest.',
+          ),
+      }),
+      outputSchema: z.object({
+        id: mcpIdInput.describe('Note id that was read.'),
+        format: z.enum(['text', 'base64']).describe('Output shape that was returned.'),
+        text: z.string().describe('Note text (or its Base64), cut at maxChars when truncated.'),
+        truncated: z.boolean().describe('True when the text was cut at maxChars.'),
+        totalChars: z
+          .number()
+          .int()
+          .describe('Full note length in text characters, counted before Base64 encoding.'),
+        created_at: mcpStamp('When the note was created'),
+        updated_at: mcpStamp('When the note was last changed'),
+        expires_at: mcpStamp('When the note expires'),
+      }),
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ id, format, password, maxChars }) => {
+      let loaded = await loadNote(env, id);
+      if (loaded && loaded.expired) {
+        ctx.waitUntil(deleteNote(env, id));
+        loaded = null;
+      }
+      if (!loaded) return mcpFail(mcpMissingText(id));
+      if (isProtectedRow(loaded.row)) {
+        if (!password) return mcpFail(mcpLockedText(id));
+        if (!(await verifyPassword(password, loaded.row))) {
+          return mcpFail(mcpWrongPasswordText(id));
+        }
+      }
+      const totalChars = loaded.text.length;
+      let text = loaded.text;
+      let truncated = false;
+      if (text.length > maxChars) {
+        text = text.slice(0, maxChars);
+        truncated = true;
+      }
+      const out = format === 'base64' ? bytesToBase64(encoder.encode(text)) : text;
+      const head = truncated
+        ? `Note '${id}' was cut to ${maxChars} of ${totalChars} characters. ` +
+          `To read more, call read_note again with a bigger maxChars (at least ${totalChars}).\n\n`
+        : '';
+      return mcpOk(head + out, {
+        id,
+        format,
+        text: out,
+        truncated,
+        totalChars,
+        created_at: loaded.row.created_at ?? null,
+        updated_at: loaded.row.updated_at ?? null,
+        expires_at: loaded.row.expires_at ?? null,
+      });
+    },
+  );
+
+  server.registerTool(
+    'write_note',
+    {
+      title: 'Write note',
+      description:
+        'Create a new note or replace a saved one. Use when the user wants to save, write, or overwrite a note. ' +
+        'Omit id to create a note with a fresh random id. An empty text deletes the note. ' +
+        'A locked note needs its password; a new password can only lock a note that has none yet.',
+      inputSchema: z.object({
+        id: mcpIdInput
+          .optional()
+          .describe(
+            'Note id to write. Omit it to create a note with a fresh random id (the result tells you the id).',
+          ),
+        text: z
+          .string()
+          .describe('Full new note text. An empty string deletes the note instead of saving.'),
+        password: mcpPasswordInput,
+        newPassword: z
+          .string()
+          .optional()
+          .describe(
+            'Lock the note with this password in the same write. Works only for a note with no password yet; ' +
+              'a locked note rejects it (use set_password to change a password).',
+          ),
+      }),
+      outputSchema: z.object({
+        id: mcpIdInput.describe('Note id that was written.'),
+        deleted: z.boolean().describe('True when an empty text deleted the note.'),
+        created: z.boolean().describe('True when this write created a new note.'),
+        updated_at: mcpStamp('When the note was written'),
+        expires_at: mcpStamp('When the note expires'),
+        protected: z.boolean().describe('True when the note is now locked with a password.'),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ id, text, password, newPassword }) => {
+      const noteId = id ?? (await freshNoteId(env));
+      const found = await loadNoteMeta(env, noteId);
+      const row = found ? found.row : null;
+      const locked = isProtectedRow(row);
+      if (locked && newPassword !== undefined) {
+        return mcpFail(
+          `Note '${noteId}' is already locked. A write cannot change its password; ` +
+            'call set_password to change or remove it.',
+        );
+      }
+      if (locked) {
+        if (!password) return mcpFail(mcpLockedText(noteId));
+        if (!(await verifyPassword(password, row))) return mcpFail(mcpWrongPasswordText(noteId));
+      }
+      if (text.length === 0) {
+        await deleteNote(env, noteId);
+        return mcpOk(`Note '${noteId}' was deleted (empty text).`, {
+          id: noteId,
+          deleted: true,
+          created: false,
+          updated_at: null,
+          expires_at: null,
+          protected: false,
+        });
+      }
+      if (!locked && newPassword !== undefined && newPassword.length > PASSWORD_MAX_LENGTH) {
+        return mcpFail(
+          `The new password is too long (longest ${PASSWORD_MAX_LENGTH} characters). Nothing was saved.`,
+        );
+      }
+      const isNew = !row || !!(found && found.expired);
+      const saved = await saveNote(env, noteId, text, {});
+      let prot = locked;
+      if (!locked && newPassword) {
+        await setNotePassword(env, noteId, newPassword);
+        prot = true;
+      }
+      return mcpOk(
+        isNew
+          ? `Note '${noteId}' was created.${prot ? ' It is locked with a password.' : ''}`
+          : `Note '${noteId}' was saved.${prot && !locked ? ' It is now locked with a password.' : ''}`,
+        {
+          id: noteId,
+          deleted: false,
+          created: isNew,
+          updated_at: saved.updatedAt,
+          expires_at: saved.expiresAt,
+          protected: prot,
+        },
+      );
+    },
+  );
+
+  server.registerTool(
+    'append_note',
+    {
+      title: 'Append to note',
+      description:
+        'Add text to the end of a note. Use when the user wants to add, append, or continue a note ' +
+        'without replacing it. A locked note needs its password. Appending to a missing id creates it.',
+      inputSchema: z.object({
+        id: mcpIdInput,
+        text: z.string().describe('Text to add to the end of the note.'),
+        password: mcpPasswordInput,
+      }),
+      outputSchema: z.object({
+        id: mcpIdInput.describe('Note id that was appended to.'),
+        created: z.boolean().describe('True when the note did not exist and was created.'),
+        updated_at: mcpStamp('When the note was written'),
+        expires_at: mcpStamp('When the note expires'),
+        protected: z.boolean().describe('True when the note is locked with a password.'),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ id, text, password }) => {
+      const found = await loadNoteMeta(env, id);
+      const row = found ? found.row : null;
+      if (isProtectedRow(row)) {
+        if (!password) return mcpFail(mcpLockedText(id));
+        if (!(await verifyPassword(password, row))) return mcpFail(mcpWrongPasswordText(id));
+      }
+      const isNew = !row || !!(found && found.expired);
+      const saved = await saveNote(env, id, text, { append: true });
+      return mcpOk(
+        isNew ? `Note '${id}' was created with the appended text.` : `Text was appended to note '${id}'.`,
+        {
+          id,
+          created: isNew,
+          updated_at: saved.updatedAt,
+          expires_at: saved.expiresAt,
+          protected: isProtectedRow(row),
+        },
+      );
+    },
+  );
+
+  server.registerTool(
+    'delete_note',
+    {
+      title: 'Delete note',
+      description:
+        'Delete a note forever. Use only when the user clearly wants to delete or remove a note. ' +
+        'A locked note needs its password.',
+      inputSchema: z.object({
+        id: mcpIdInput,
+        password: mcpPasswordInput,
+      }),
+      outputSchema: z.object({
+        id: mcpIdInput.describe('Note id that was deleted.'),
+        deleted: z.boolean().describe('Always true when the call succeeds.'),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ id, password }) => {
+      const found = await loadNoteMeta(env, id);
+      const row = found ? found.row : null;
+      if (!row || (found && found.expired)) return mcpFail(mcpMissingText(id));
+      if (isProtectedRow(row)) {
+        if (!password) return mcpFail(mcpLockedText(id));
+        if (!(await verifyPassword(password, row))) return mcpFail(mcpWrongPasswordText(id));
+      }
+      await deleteNote(env, id);
+      return mcpOk(`Note '${id}' was deleted.`, { id, deleted: true });
+    },
+  );
+
+  server.registerTool(
+    'set_expiry',
+    {
+      title: 'Set note expiry',
+      description:
+        'Change only when a note expires, keeping its text. Use when the user wants a note ' +
+        'to live for 24 hours, 72 hours, 1 week, or to never expire. A locked note needs its password.',
+      inputSchema: z.object({
+        id: mcpIdInput,
+        token: z
+          .enum(['24h', '72h', '1w', 'never'])
+          .describe("New expiry: '24h', '72h', '1w', or 'never'."),
+        password: mcpPasswordInput,
+      }),
+      outputSchema: z.object({
+        id: mcpIdInput.describe('Note id whose expiry changed.'),
+        created_at: mcpStamp('When the note was created'),
+        updated_at: mcpStamp('When the note was last changed'),
+        expires_at: mcpStamp('When the note now expires'),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ id, token, password }) => {
+      const found = await loadNoteMeta(env, id);
+      const row = found ? found.row : null;
+      if (!row) return mcpFail(mcpMissingText(id));
+      if (isProtectedRow(row)) {
+        if (!password) return mcpFail(mcpLockedText(id));
+        if (!(await verifyPassword(password, row))) return mcpFail(mcpWrongPasswordText(id));
+      }
+      const saved = await setNoteExpiry(env, id, resolveExpiryToken(token));
+      if (!saved) return mcpFail(mcpMissingText(id));
+      return mcpOk(
+        saved.expiresAt == null
+          ? `Note '${id}' will never expire now.`
+          : `Note '${id}' now expires at ${formatUtc(saved.expiresAt)}.`,
+        {
+          id,
+          created_at: saved.createdAt,
+          updated_at: saved.updatedAt,
+          expires_at: saved.expiresAt,
+        },
+      );
+    },
+  );
+
+  server.registerTool(
+    'set_password',
+    {
+      title: 'Set note password',
+      description:
+        'Set, change, or remove a note password. Use when the user wants to lock, protect, unlock, ' +
+        'or change the password of a note. A locked note needs its current password; ' +
+        'pass an empty newPassword to remove protection.',
+      inputSchema: z.object({
+        id: mcpIdInput,
+        currentPassword: z
+          .string()
+          .default('')
+          .describe('Current password. Needed only when the note is already locked.'),
+        newPassword: z
+          .string()
+          .optional()
+          .describe('New password. An empty string removes protection from the note.'),
+      }),
+      outputSchema: z.object({
+        id: mcpIdInput.describe('Note id whose password changed.'),
+        protected: z.boolean().describe('True when the note is now locked with a password.'),
+        updated_at: mcpStamp('When the password changed'),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ id, currentPassword, newPassword }) => {
+      if (newPassword === undefined) {
+        return mcpFail(
+          `'newPassword' is required. Pass a new password to set it, or an empty string ` +
+            `to remove protection from note '${id}'.`,
+        );
+      }
+      if (newPassword.length > PASSWORD_MAX_LENGTH) {
+        return mcpFail(
+          `The new password is too long (longest ${PASSWORD_MAX_LENGTH} characters). Nothing changed.`,
+        );
+      }
+      const found = await loadNoteMeta(env, id);
+      const row = found ? found.row : null;
+      if (!row || (found && found.expired)) return mcpFail(mcpMissingText(id));
+      if (isProtectedRow(row)) {
+        if (!currentPassword) {
+          return mcpFail(
+            `Note '${id}' is locked. Pass the current password in 'currentPassword'. Nothing changed.`,
+          );
+        }
+        if (!(await verifyPassword(currentPassword, row))) {
+          return mcpFail(`Wrong current password for note '${id}'. Nothing changed.`);
+        }
+      }
+      let stamp;
+      let prot;
+      if (newPassword === '') {
+        stamp = Date.now();
+        await env.DB.prepare(
+          `UPDATE notes SET is_protected = 0, password_hash = NULL,
+                            password_salt = NULL, password_algo = NULL, updated_at = ?
+             WHERE id = ?`,
+        ).bind(stamp, id).run();
+        prot = false;
+      } else {
+        stamp = await setNotePassword(env, id, newPassword);
+        prot = true;
+      }
+      return mcpOk(
+        prot
+          ? `Note '${id}' is now locked with a password.`
+          : `Password protection was removed from note '${id}'.`,
+        { id, protected: prot, updated_at: stamp },
+      );
+    },
+  );
+
+  return server;
+}
+
+/**
+ * MCP endpoint handler (Streamable HTTP, stateless). Only POST is allowed.
+ * Every request gets a fresh McpServer plus a fresh transport — instances
+ * are never reused across requests. Any Mcp-Session-Id the client sends is
+ * dropped: stateless mode issues no sessions and performs no validation.
+ */
+async function handleMcp(request, env, ctx) {
+  if (request.method !== 'POST') {
+    return new Response('Method Not Allowed', {
+      status: 405,
+      headers: noStore({
+        'Content-Type': 'text/plain; charset=utf-8',
+        Allow: 'POST',
+      }),
+    });
+  }
+  const deny = mcpAuthHook(request);
+  if (deny) return deny;
+  const cleanHeaders = new Headers(request.headers);
+  cleanHeaders.delete('mcp-session-id');
+  const cleanRequest = new Request(request, { headers: cleanHeaders });
+  const server = createMcpServer(env, ctx);
+  const transport = new WebStandardStreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+  });
+  await server.connect(transport);
+  const res = await transport.handleRequest(cleanRequest);
+  // Keep the product promise: every response carries no-store + noindex.
+  const headers = new Headers(res.headers);
+  for (const [name, value] of Object.entries(noStore())) headers.set(name, value);
+  return new Response(res.body, { status: res.status, headers });
+}
+
+// ---------------------------------------------------------------------------
 // Worker entrypoint
 // ---------------------------------------------------------------------------
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // MCP endpoint (Streamable HTTP, stateless). Exact path only: /mcp.txt
+    // and friends stay normal notes.
+    if (url.pathname === '/mcp') return handleMcp(request, env, ctx);
+
     const segments = url.pathname.split('/').filter(Boolean);
 
     if (segments.length === 0) {

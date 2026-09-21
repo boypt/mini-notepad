@@ -432,8 +432,84 @@ requests that do not match a file go to the Worker.
   missing or wrong password returns `401`.
 - The browser asks for the password one time. It then remembers the password
   in localStorage for that note.
+- The MCP endpoint (`POST /mcp`) has no login. Any client that can reach the
+  URL can use the six tools. A locked note still needs its password, passed
+  as a tool argument. See [MCP](./README.md#mcp-ai-assistant-access).
 - Note passwords protect single notes, not the whole site. For site-wide
   control, use Cloudflare Access.
 - A new note gets a 5-character random ID (about 17 million combinations).
   You can also pick your own ID of any length. Either way, the ID is **not**
   strong access control. Do not rely on the ID to hide secret content.
+
+---
+
+## 15. MCP (AI assistant access)
+
+An AI assistant can read and write notes through MCP
+(Model Context Protocol). The endpoint is:
+
+```text
+https://<your-worker>/mcp
+```
+
+It uses Streamable HTTP. It keeps no session. Each request is handled on
+its own.
+
+It has no login. Any client that can reach the URL can use it. A locked
+note still needs its password, passed as a tool argument. If you need
+site-wide control, put the Worker behind Cloudflare Access.
+
+Six tools:
+
+| Tool | What it does |
+| --- | --- |
+| `read_note` | Reads a note. Long notes are cut (default 25000 chars). |
+| `write_note` | Creates or replaces a note. No `id` makes a new random ID. |
+| `append_note` | Adds text to the end of a note. |
+| `delete_note` | Deletes a note forever. |
+| `set_expiry` | Changes only the expiry (`24h`, `72h`, `1w`, `never`). |
+| `set_password` | Sets, changes, or removes the note password. |
+
+Add it to your client. You only need the URL. No headers, no keys.
+
+Cursor, VS Code, and Claude Desktop use `mcp-remote`:
+
+```json
+{
+  "mcpServers": {
+    "web-notepad": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://<your-worker>/mcp"]
+    }
+  }
+}
+```
+
+Claude Code CLI:
+
+```sh
+claude mcp add --transport http web-notepad https://<your-worker>/mcp
+```
+
+Test it from the command line. Each call is one JSON-RPC POST:
+
+```sh
+BASE=https://<your-worker>
+
+# List the tools.
+curl -s -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$BASE/mcp"
+
+# Write and read a note.
+curl -s -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_note","arguments":{"id":"mcp-test","text":"hello"}}}' \
+  "$BASE/mcp"
+curl -s -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_note","arguments":{"id":"mcp-test"}}}' \
+  "$BASE/mcp"
+```
+
+`GET /mcp` and `DELETE /mcp` return `405`. Only `POST /mcp` works.
