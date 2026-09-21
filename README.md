@@ -28,6 +28,9 @@ steps.
   [Command line](#command-line).
 - Auto-save, line numbers, font size, copy/paste buttons, and an expiry choice.
 - Lock a note with a password. The status bar shows the lock state.
+- AI assistant access over MCP (`POST /mcp`, no login): read, write,
+  append, delete, expiry, and password tools. See
+  [MCP](#mcp-ai-assistant-access).
 - Made for IT maintenance and programmers who need to share code or text
   quickly.
 
