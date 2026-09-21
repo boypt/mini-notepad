@@ -448,6 +448,19 @@ function isCliUserAgent(userAgent) {
   return CLI_USER_AGENTS.some((name) => ua.startsWith(name));
 }
 
+/**
+ * True for link-preview crawlers (Telegram, X/Twitter, Facebook, LinkedIn,
+ * Discord, Slack, WhatsApp). They never run the `.page` loader JS, so any
+ * 200 shell they fetch becomes a saved preview. Locked notes must 401 them
+ * instead — otherwise a link pasted to chat generates a preview entry for a
+ * note the chat cannot open.
+ */
+const PREVIEW_BOT_RE =
+  /telegrambot|twitterbot|facebookexternalhit|facebot|linkedinbot|discordbot|slackbot|whatsapp/i;
+function isPreviewBot(userAgent) {
+  return PREVIEW_BOT_RE.test(userAgent || '');
+}
+
 /** Per-note CSRF token: HMAC-SHA256 of the note id. */
 function csrfToken(env, id) {
   const secret = env.CSRF_SECRET || DEFAULT_CSRF_SECRET;
@@ -814,7 +827,10 @@ async function handleGet(request, env, ctx, id, mode) {
     // decompressed. Missing notes keep the `.txt` semantics (XHR 404 for the
     // loader, 302 back to the editor for a direct navigation). Locked notes
     // get the same empty shell (200); the loader fetches `.txt` and prompts
-    // for the password on 401, mirroring the editor flow.
+    // for the password on 401, mirroring the editor flow. The one exception
+    // is link-preview crawlers: they never run JS, so a 200 shell would be
+    // saved as a preview entry for a note the chat cannot open — a locked
+    // note 401s them instead (a valid `?pw=` still passes, same as `.txt`).
     let found = await loadNoteMeta(env, id);
     if (found && found.expired) {
       ctx.waitUntil(deleteNote(env, id));
@@ -823,6 +839,10 @@ async function handleGet(request, env, ctx, id, mode) {
     if (!found) {
       if (request.headers.get('X-Requested-With') === 'XMLHttpRequest') return notFound();
       return redirect('/' + id);
+    }
+    if (isProtectedRow(found.row) && isPreviewBot(request.headers.get('user-agent'))) {
+      const botDeny = await checkReadPassword(request, url, found.row);
+      if (botDeny) return botDeny;
     }
     return modeResponse({ row: found.row, text: '' }, mode, {
       origin: url.origin,
