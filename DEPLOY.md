@@ -116,13 +116,16 @@ curl -s -D - -o /dev/null http://127.0.0.1:8787/
 
 # CLI write to the root. The Worker makes a random ID and prints it in the
 # receipt. The output looks like:
-#   Saved.
-#   Note:    7k2ma
-#   Saved:   2026-01-31 12:00:00 UTC
-#   Expires: 2026-03-02 12:00:00 UTC
-#   Plain:   http://127.0.0.1:8787/7k2ma.txt
-#   Base64:  http://127.0.0.1:8787/7k2ma.base64
-#   Editor:  http://127.0.0.1:8787/7k2ma
+#   {
+#     "status": "saved",
+#     "note": "7k2ma",
+#     "saved": "2026-01-31 12:00:00 UTC",
+#     "expires": "2026-03-02 12:00:00 UTC",
+#     "plain": "http://127.0.0.1:8787/7k2ma.txt",
+#     "base64": "http://127.0.0.1:8787/7k2ma.base64",
+#     "page": "http://127.0.0.1:8787/7k2ma.page",
+#     "editor": "http://127.0.0.1:8787/7k2ma"
+#   }
 echo hello | curl --data-binary @- http://127.0.0.1:8787/
 
 # CLI write and read. A curl user agent gets the raw text.
@@ -139,7 +142,7 @@ echo " world" | curl --data-binary @- http://127.0.0.1:8787/cli-test/append
 curl http://127.0.0.1:8787/cli-test            # hello world
 
 # Change only the expiry from the command line. POST to /:note/expire, so the
-# body stays the same. The receipt starts with "Expiry set." and shows the new
+# body stays the same. The receipt shows "status": "expiry set" and the new
 # Expires. It accepts 24h, 72h, 1w, or never.
 curl -d 'expires=24h'   http://127.0.0.1:8787/cli-test/expire
 curl -d 'expires=never' http://127.0.0.1:8787/cli-test/expire

@@ -51,14 +51,17 @@ echo "hello" | curl --data-binary @- https://<your-worker>/my-note
 
 The save prints a receipt with the time and the read URLs:
 
-```text
-Saved.
-Note:    my-note
-Saved:   2026-01-31 12:00:00 UTC
-Expires: 2026-03-02 12:00:00 UTC
-Plain:   https://<your-worker>/my-note.txt
-Base64:  https://<your-worker>/my-note.base64
-Editor:  https://<your-worker>/my-note
+```json
+{
+  "status": "saved",
+  "note": "my-note",
+  "saved": "2026-01-31 12:00:00 UTC",
+  "expires": "2026-03-02 12:00:00 UTC",
+  "plain": "https://<your-worker>/my-note.txt",
+  "base64": "https://<your-worker>/my-note.base64",
+  "page": "https://<your-worker>/my-note.page",
+  "editor": "https://<your-worker>/my-note"
+}
 ```
 
 Save with a random ID. Post to `/`. The Worker makes a short random ID and

@@ -145,6 +145,14 @@ function jsonOk(value) {
   });
 }
 
+/** Pretty-printed JSON response for command-line (curl/wget) writes. */
+function prettyJsonOk(value) {
+  return new Response(JSON.stringify(value, null, 2) + '\n', {
+    status: 200,
+    headers: noStore({ 'Content-Type': 'application/json; charset=utf-8' }),
+  });
+}
+
 function notFound() {
   return new Response('Not found', {
     status: 404,
@@ -601,25 +609,24 @@ async function setNotePassword(env, id, newPw) {
 // ---------------------------------------------------------------------------
 
 /**
- * Friendly plain-text receipt for a command-line write (curl/wget): confirms
- * the save, prints the save time, and lists the read URLs.
+ * Pretty JSON receipt for a command-line write (curl/wget): confirms the
+ * save, prints the save time, and lists the read URLs.
  */
 function cliReceipt(url, id, verb, updatedAt, expiresAt) {
-  return textOk([
-    `${verb}.`,
-    `Note:    ${id}`,
-    `Saved:   ${formatUtc(updatedAt)}`,
-    `Expires: ${formatUtc(expiresAt)}`,
-    `Plain:   ${url.origin}/${id}.txt`,
-    `Base64:  ${url.origin}/${id}.base64`,
-    `Page:    ${url.origin}/${id}.page`,
-    `Editor:  ${url.origin}/${id}`,
-    '',
-  ].join('\n'));
+  return prettyJsonOk({
+    status: verb.toLowerCase(),
+    note: id,
+    saved: formatUtc(updatedAt),
+    expires: formatUtc(expiresAt),
+    plain: `${url.origin}/${id}.txt`,
+    base64: `${url.origin}/${id}.base64`,
+    page: `${url.origin}/${id}.page`,
+    editor: `${url.origin}/${id}`,
+  });
 }
 
 function cliDeleted(id) {
-  return textOk(`Deleted.\nNote:    ${id}\n`);
+  return prettyJsonOk({ status: 'deleted', note: id });
 }
 
 async function handlePost(request, env, ctx, id, mode) {
@@ -663,14 +670,11 @@ async function handlePost(request, env, ctx, id, mode) {
       locked = true;
     }
     if (cli) {
-      return textOk(
-        [
-          locked ? 'Password set.' : 'Protection removed.',
-          `Note:    ${id}`,
-          `Protected: ${locked ? 'yes' : 'no'}`,
-          '',
-        ].join('\n'),
-      );
+      return prettyJsonOk({
+        status: locked ? 'password set' : 'protection removed',
+        note: id,
+        protected: locked,
+      });
     }
     return jsonOk({ protected: locked, updated_at: stamp });
   }
@@ -2158,37 +2162,37 @@ export function renderPageView(id, textOrMeta, metaOrOrigin, maybeOrigin) {
     + '<meta name="robots" content="noindex, nofollow">\n'
     + '<style>\n'
     + '*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}body{margin:0;background:#fff;color:#222;font-family:Georgia,Cambria,"Times New Roman",serif;font-size:18px;line-height:1.58}\n'
-    + '.wrap{max-width:732px;margin:0 auto;padding:21px 0 60px}main{display:block}\n'
-    + 'h1{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:32px;line-height:1.25;font-weight:700;margin:21px 21px 12px;overflow-wrap:break-word}\n'
-    + 'address{font-style:normal;font-size:15px;color:#79828B;margin:0 21px 21px}\n'
-    + '.content p{margin:0 21px 12px;overflow-wrap:break-word}\n'
-    + '.content h2{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:28px;line-height:1.3;font-weight:700;margin:26px 21px 12px}\n'
-    + '.content h3{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:24px;line-height:1.35;font-weight:700;margin:24px 21px 10px}\n'
-    + '.content h4{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:21px;line-height:1.4;font-weight:700;margin:22px 21px 10px}\n'
+    + '.wrap{max-width:732px;margin:0 auto;padding:1.17em 1.17em 3.34em}main{display:block}\n'
+    + 'h1{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:32px;line-height:1.25;font-weight:700;margin:0.66em 0 0.38em;overflow-wrap:break-word}\n'
+    + 'address{font-style:normal;font-size:15px;color:#79828B;margin:0 0 1.4em}\n'
+    + '.content p{margin:0 0 0.67em;overflow-wrap:break-word}\n'
+    + '.content h2{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:28px;line-height:1.3;font-weight:700;margin:0.93em 0 0.43em}\n'
+    + '.content h3{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:24px;line-height:1.35;font-weight:700;margin:1em 0 0.42em}\n'
+    + '.content h4{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:21px;line-height:1.4;font-weight:700;margin:1.05em 0 0.48em}\n'
     + '.content a{color:inherit;text-decoration:underline}\n'
-    + '.content code{font-family:Menlo,Consolas,monospace;font-size:16px;background:#F5F8FC;padding:2px 4px;border-radius:3px;overflow-wrap:break-word}\n'
-    + '.content pre{background:#F5F8FC;padding:14px 21px;margin:0 0 14px;overflow-x:auto}\n'
+    + '.content code{font-family:Menlo,Consolas,monospace;font-size:16px;background:#F5F8FC;padding:0.13em 0.25em;border-radius:3px;overflow-wrap:break-word}\n'
+    + '.content pre{background:#F5F8FC;padding:0.78em 1.17em;margin:0 0 0.78em;overflow-x:auto}\n'
     + '.content pre code{background:none;padding:0;border-radius:0}\n'
-    + '.content blockquote{margin:0 21px 14px;padding:0 0 0 16px;border-left:3px solid #000;font-style:italic}\n'
+    + '.content blockquote{margin:0 0 0.78em;padding:0 0 0 0.89em;border-left:3px solid #000;font-style:italic}\n'
     + '.content blockquote p{margin:0}\n'
-    + '.content ul,.content ol{margin:0 21px 14px;padding:0;list-style:none}\n'
-    + '.content ul li{position:relative;padding-left:24px;margin-bottom:8px}\n'
+    + '.content ul,.content ol{margin:0 0 0.78em;padding:0;list-style:none}\n'
+    + '.content ul li{position:relative;padding-left:1.33em;margin-bottom:0.44em}\n'
     + '.content ul li:before{content:"•";position:absolute;left:8px}\n'
-    + '.content ol{counter-reset:pageol}.content ol li{position:relative;padding-left:30px;margin-bottom:8px;counter-increment:pageol}\n'
+    + '.content ol{counter-reset:pageol}.content ol li{position:relative;padding-left:1.67em;margin-bottom:0.44em;counter-increment:pageol}\n'
     + '.content ol li:before{content:counter(pageol) ".";position:absolute;left:8px}\n'
     + '.content img{max-width:100%;height:auto;display:block}\n'
-    + '.content figure{margin:0 0 16px;text-align:center}\n'
+    + '.content figure{margin:0 0 0.89em;text-align:center}\n'
     + '.content figure img{margin:0 auto}\n'
-    + '.content figcaption{font-size:15px;color:#79828B;margin-top:8px;padding:0 21px}\n'
-    + '.content hr{border:none;border-top:1px solid #c9cdd1;width:50%;margin:24px auto}\n'
-    + '.content table{margin:0 21px 16px;border-collapse:collapse;width:calc(100% - 42px);display:block;overflow-x:auto}\n'
-    + '.content th,.content td{border:1px solid #ddd;padding:8px 12px;text-align:left;font-size:16px;overflow-wrap:break-word}\n'
+    + '.content figcaption{font-size:15px;color:#79828B;margin-top:0.53em;padding:0}\n'
+    + '.content hr{border:none;border-top:1px solid #c9cdd1;width:50%;margin:1.33em auto}\n'
+    + '.content table{margin:0 0 0.89em;border-collapse:collapse;width:100%;display:block;overflow-x:auto}\n'
+    + '.content th,.content td{border:1px solid #ddd;padding:0.5em 0.75em;text-align:left;font-size:16px;overflow-wrap:break-word}\n'
     + '.content th{background:#F5F8FC;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-weight:700}\n'
     + '.content tbody tr:nth-child(even) td{background:#fafbfc}\n'
     + '.content .empty{color:#79828B;font-style:italic}\n'
-    + 'footer{margin:32px 21px 0;font-size:15px;color:#79828B;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}\n'
+    + 'footer{margin:2.13em 0 0;font-size:15px;color:#79828B;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}\n'
     + 'footer a{color:inherit}\n'
-    + '@media(max-width:480px){.wrap{padding:16px 0 40px}h1{font-size:28px;margin:16px 16px 10px}address,.content p,.content h2,.content h3,.content h4,.content blockquote,.content ul,.content ol,footer{margin-left:16px;margin-right:16px}}\n'
+    + '@media(max-width:480px){.wrap{padding:0.89em 0.89em 2.22em}h1{font-size:28px;margin:0.57em 0 0.36em}}\n'
     + '</style>\n'
     + '</head>\n'
     + '<body>\n'
