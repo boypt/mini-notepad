@@ -877,7 +877,7 @@ function modeResponse(loaded, mode, extra) {
       // is always kept.
       if (/telegrambot/i.test(userAgent)) delete headers['X-Robots-Tag'];
       return new Response(
-        renderPageView(row.id, { createdAt: row.created_at, updatedAt: row.updated_at }, origin),
+        renderPageView(row.id, { createdAt: row.created_at, updatedAt: row.updated_at, expiresAt: row.expires_at }, origin),
         { headers },
       );
     }
@@ -2180,8 +2180,8 @@ main {
 
 /**
  * Empty read-only shell for `.page` in a minimal Telegraph-like frame:
- * centred 732px column, header (title + date), article, and a back-to-editor
- * footer. The body is never rendered on the server: a small inline ES5 script
+ * centred 732px column, header (title + Created/Expires dates), article,
+ * and a back-to-editor footer. The body is never rendered on the server: a small inline ES5 script
  * (same XHR style as the editor — `XMLHttpRequest` with `X-Requested-With`,
  * so a missing note reads as 404) fetches `/<id>.txt` and renders Markdown
  * in the browser with markdown-it from a CDN (cdnjs primary with SRI,
@@ -2190,8 +2190,12 @@ main {
  * Password reuse: the loader mirrors the editor flow — the stored
  * `localStorage` password first, then `?pw=`, then one `prompt()` retry on
  * 401. A 401 never renders body text, only a "protected" placeholder.
- * `meta` takes `{ createdAt, updatedAt }` (a notes row with `created_at` /
- * `updated_at` works too); `origin` builds the absolute og:url. The title
+ * `meta` takes `{ createdAt, updatedAt, expiresAt }` (a notes row with
+ * `created_at` / `updated_at` / `expires_at` works too); `origin` builds the
+ * absolute og:url. Header dates print as UTC text server-side and are
+ * rewritten to the browser's local time by a small inline script
+ * (`data-stamp` holds the epoch milliseconds); without JS the UTC text
+ * stays readable. The title
  * and description fall back to the note id: crawlers (Telegram included) do
  * not run the loader JS, so no body excerpt can be offered server-side
  * without rendering the body there. `text` is accepted as a legacy second
@@ -2211,10 +2215,22 @@ export function renderPageView(id, textOrMeta, metaOrOrigin, maybeOrigin) {
   const m = meta || {};
   const createdAt = m.createdAt !== undefined ? m.createdAt : m.created_at;
   const updatedAt = m.updatedAt !== undefined ? m.updatedAt : m.updated_at;
-  const stamp = updatedAt != null ? updatedAt : createdAt != null ? createdAt : null;
-  const addressHtml = stamp != null
-    ? '<address>' + escapeHtml(formatUtc(stamp)) + '</address>'
+  const expiresAt = m.expiresAt !== undefined ? m.expiresAt : m.expires_at;
+  const createdHtml = createdAt != null
+    ? '<address data-label="Created" data-stamp="' + createdAt + '">Created: '
+      + escapeHtml(formatUtc(createdAt)) + '</address>'
     : '';
+  // formatUtc(null) is 'never', so a note that never expires reads
+  // "Expires: never". An undefined expiry (legacy callers) shows nothing.
+  // data-stamp lets the inline script below rewrite the UTC fallback into
+  // the browser's local time; without JS the UTC text stays readable.
+  const expiresHtml = expiresAt !== undefined
+    ? (expiresAt == null
+      ? '<address>Expires: never</address>'
+      : '<address data-label="Expires" data-stamp="' + expiresAt + '">Expires: '
+        + escapeHtml(formatUtc(expiresAt)) + '</address>')
+    : '';
+  const addressHtml = createdHtml + (createdHtml && expiresHtml ? '\n' : '') + expiresHtml;
   const plainDesc = 'Web Notepad — ' + safeId;
   let createdISO = '';
   let updatedISO = '';
@@ -2295,6 +2311,26 @@ export function renderPageView(id, textOrMeta, metaOrOrigin, maybeOrigin) {
     + '</main>\n'
     + '</div>\n'
     + '<script src="https://cdnjs.cloudflare.com/ajax/libs/markdown-it/13.0.2/markdown-it.min.js" integrity="sha512-ohlWmsCxOu0bph1om5eDL0jm/83eH09fvqLDhiEdiqfDeJbEvz4FSbeY0gLJSVJwQAp0laRhTXbUQG+ZUuifUQ==" crossorigin="anonymous" onerror="(function(){var s=document.createElement(\'script\');s.src=\'https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js\';document.head.appendChild(s);})()">\n'
+    + '</script>\n'
+    + '<script>\n'
+    + '/* header dates: the server prints UTC as a fallback; rewrite to browser local time when JS runs */\n'
+    + '(function () {\n'
+    + '"use strict";\n'
+    + 'function fmtLocal(ms) {\n'
+    + '    var d = new Date(ms);\n'
+    + '    try { return d.toLocaleString(undefined, { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); }\n'
+    + '    catch (err) { return d.toLocaleString(); }\n'
+    + '}\n'
+    + 'try {\n'
+    + '    var els = document.querySelectorAll("address[data-stamp]");\n'
+    + '    for (var i = 0; i < els.length; i++) {\n'
+    + '        var ms = parseInt(els[i].getAttribute("data-stamp"), 10);\n'
+    + '        if (isNaN(ms)) continue;\n'
+    + '        var label = els[i].getAttribute("data-label") || "";\n'
+    + '        els[i].textContent = label + ": " + fmtLocal(ms);\n'
+    + '    }\n'
+    + '} catch (err) {}\n'
+    + '})();\n'
     + '</script>\n'
     + '<script>\n'
     + '/* page loader: fetch the raw text, then render Markdown with markdown-it */\n'
