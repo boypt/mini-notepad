@@ -94,8 +94,10 @@ curl -d 'expires=24h'   https://<your-worker>/my-note/expire
 curl -d 'expires=never' https://<your-worker>/my-note/expire
 ```
 
-`expires` accepts `24h`, `72h`, `1w`, or `never`. A new note lives for
-`NOTE_TTL_DAYS` (default `30` days).
+`expires` accepts `never` or any duration: `24h`, `72h`, `1w`, `90m`,
+`36h`, `30d`, `6mo`, `1y`. You can mix units: `1w2d`. A new note without
+a choice lives for `NOTE_TTL_DAYS` (default `30` days). The web page only
+shows `24h`, `72h`, `1w`, and `never`, but the API takes any of these.
 
 You can also save a new body and set the expiry in one call:
 
@@ -157,10 +159,10 @@ Six tools:
 | Tool | What it does |
 | --- | --- |
 | `read_note` | Reads a note. Long notes are cut (default 25000 chars). |
-| `write_note` | Creates or replaces a note. No `id` makes a new random ID. |
-| `append_note` | Adds text to the end of a note. |
+| `write_note` | Creates or replaces a note. No `id` makes a new random ID. Can set `expires` (`24h`, `72h`, `1w`, `never`) and `newPassword` in the same call. |
+| `append_note` | Adds text to the end of a note. Can set `expires` in the same call. |
 | `delete_note` | Deletes a note forever. |
-| `set_expiry` | Changes only the expiry (`24h`, `72h`, `1w`, `never`). |
+| `set_expiry` | Changes only the expiry (`never` or any duration like `30d`). |
 | `set_password` | Sets, changes, or removes the note password. |
 
 Read, write, and append results include `urls`
@@ -203,7 +205,8 @@ at https://<your-worker>/mcp. Use its MCP tools:
   random id. An empty text deletes the note.
 - append_note to add text to the end without replacing.
 - delete_note only when I clearly ask to delete.
-- set_expiry to change only the expiry: 24h, 72h, 1w, or never.
+- set_expiry to change only the expiry: never or any duration
+  like 90m, 36h, 30d, 6mo, or 1y.
 - set_password to lock, unlock, or change a note password.
 
 Rules: note ids use a-z, A-Z, 0-9, _ and -.

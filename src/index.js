@@ -95,12 +95,26 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const CODEC = 'zstd';
 /** Bodies shorter than this many UTF-8 bytes are stored uncompressed. */
 const PLAINTEXT_MAX_BYTES = 128;
-/** Expiry options offered by the web UI, as durations in milliseconds. */
+/** Expiry choices shown by the web UI select; the API accepts more (see below). */
 const EXPIRY_TOKENS = {
   '24h': DAY_MS,
   '72h': 3 * DAY_MS,
   '1w': 7 * DAY_MS,
 };
+/** Longest expiry the API accepts (10 years); longer values are rejected. */
+const MAX_EXPIRY_MS = 10 * 365 * DAY_MS;
+/** Unit words accepted in an expiry duration, mapped to milliseconds. */
+const EXPIRY_UNIT_MS = {
+  s: 1000, sec: 1000, secs: 1000, second: 1000, seconds: 1000,
+  m: 60 * 1000, min: 60 * 1000, mins: 60 * 1000, minute: 60 * 1000, minutes: 60 * 1000,
+  h: 60 * 60 * 1000, hr: 60 * 60 * 1000, hrs: 60 * 60 * 1000, hour: 60 * 60 * 1000, hours: 60 * 60 * 1000,
+  d: DAY_MS, day: DAY_MS, days: DAY_MS,
+  w: 7 * DAY_MS, week: 7 * DAY_MS, weeks: 7 * DAY_MS,
+  mo: 30 * DAY_MS, mos: 30 * DAY_MS, mon: 30 * DAY_MS, month: 30 * DAY_MS, months: 30 * DAY_MS,
+  y: 365 * DAY_MS, yr: 365 * DAY_MS, yrs: 365 * DAY_MS, year: 365 * DAY_MS, years: 365 * DAY_MS,
+};
+/** Shared hint text for expiry arguments. */
+const EXPIRY_HINT = "Use 'never', or a duration like '90m', '36h', '30d', '1w2d', '6mo', '1y'.";
 /** PBKDF2 iteration count for note passwords. */
 const PBKDF2_ITERATIONS = 100000;
 /** Algorithm tag stored in notes.password_algo; only this value is accepted. */
@@ -222,16 +236,56 @@ export function encodeForStorage(text) {
 }
 
 /**
- * Map a web-UI expiry token to an `expires` argument for saveNote.
- * `undefined` means "no choice" (saveNote keeps the note's current expiry, or
- * uses NOTE_TTL_DAYS for a new note); `null` means "never expires".
+ * Parse a free-form expiry duration like '90m', '36h', '30d', '1w2d',
+ * '6mo', or '1y' into milliseconds. Returns undefined for anything that
+ * is not a positive duration of at most 10 years. A bare number with no
+ * unit is rejected, so '3600' never means seconds or milliseconds by
+ * accident. The web UI only offers a few choices, but the API takes any
+ * value this function accepts.
+ */
+export function parseExpiryDuration(raw) {
+  if (typeof raw !== 'string') return undefined;
+  const text = raw.trim().toLowerCase();
+  if (!text) return undefined;
+  const re =
+    /\s*(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|months?|mos?|mon|m|hours?|hrs?|hr|h|days?|d|weeks?|w|years?|yrs?|yr|y)/gy;
+  let total = 0;
+  let count = 0;
+  let pos = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const unit = EXPIRY_UNIT_MS[m[2]];
+    if (unit === undefined) return undefined;
+    total += parseFloat(m[1]) * unit;
+    count++;
+    if (count > 16) return undefined;
+    pos = re.lastIndex;
+  }
+  // Note: a failed exec resets re.lastIndex to 0, so the end position is
+  // kept in pos instead.
+  if (!count || !/^\s*$/.test(text.slice(pos))) return undefined;
+  if (!Number.isFinite(total)) return undefined;
+  const ms = Math.round(total);
+  if (ms <= 0 || ms > MAX_EXPIRY_MS) return undefined;
+  return ms;
+}
+
+/**
+ * Map an expiry argument to a `saveNote`/`setNoteExpiry` `expires` value.
+ * `undefined` means "no choice" (keep the note's current expiry, or use
+ * NOTE_TTL_DAYS for a new note); `null` means "never expires". Besides the
+ * web-UI tokens ('24h', '72h', '1w') and 'never', any duration that
+ * `parseExpiryDuration` accepts works too ('90m', '36h', '30d', ...).
+ * Anything else is also `undefined`, so callers that need to tell "bad
+ * value" apart from "no choice" must check the raw input first.
  */
 export function resolveExpiryToken(token) {
-  if (token == null || token === '') return undefined;
-  if (token === 'never') return null;
-  return Object.prototype.hasOwnProperty.call(EXPIRY_TOKENS, token)
-    ? EXPIRY_TOKENS[token]
-    : undefined;
+  if (token == null) return undefined;
+  const text = String(token).trim();
+  if (text === '') return undefined;
+  if (text === 'never') return null;
+  if (Object.prototype.hasOwnProperty.call(EXPIRY_TOKENS, text)) return EXPIRY_TOKENS[text];
+  return parseExpiryDuration(text);
 }
 
 /**
@@ -2635,7 +2689,8 @@ function createMcpServer(env, ctx, origin) {
       description:
         'Create a new note or replace a saved one. Use when the user wants to save, write, or overwrite a note. ' +
         'Omit id to create a note with a fresh random id. An empty text deletes the note. ' +
-        'A locked note needs its password; a new password can only lock a note that has none yet.',
+        'A locked note needs its password; a new password can only lock a note that has none yet. ' +
+        'Omit expires to keep the current expiry.',
       inputSchema: z.object({
         id: mcpIdInput
           .optional()
@@ -2652,6 +2707,14 @@ function createMcpServer(env, ctx, origin) {
           .describe(
             'Lock the note with this password in the same write. Works only for a note with no password yet; ' +
               'a locked note rejects it (use set_password to change a password).',
+          ),
+        expires: z
+          .string()
+          .optional()
+          .describe(
+            'Note expiry in the same write. ' +
+              EXPIRY_HINT +
+              ' Omit it to keep the current expiry (a new note uses the server default).',
           ),
       }),
       outputSchema: z.object({
@@ -2670,7 +2733,7 @@ function createMcpServer(env, ctx, origin) {
         openWorldHint: false,
       },
     },
-    async ({ id, text, password, newPassword }) => {
+    async ({ id, text, password, newPassword, expires }) => {
       const noteId = id ?? (await freshNoteId(env));
       const found = await loadNoteMeta(env, noteId);
       const row = found ? found.row : null;
@@ -2702,8 +2765,17 @@ function createMcpServer(env, ctx, origin) {
           `The new password is too long (longest ${PASSWORD_MAX_LENGTH} characters). Nothing was saved.`,
         );
       }
+      let resolvedExpiry;
+      if (expires !== undefined) {
+        resolvedExpiry = resolveExpiryToken(expires);
+        if (resolvedExpiry === undefined) {
+          return mcpFail(
+            `Unknown expiry '${expires}'. ${EXPIRY_HINT} Nothing was saved.`,
+          );
+        }
+      }
       const isNew = !row || !!(found && found.expired);
-      const saved = await saveNote(env, noteId, text, {});
+      const saved = await saveNote(env, noteId, text, { expires: resolvedExpiry });
       let prot = locked;
       if (!locked && newPassword) {
         await setNotePassword(env, noteId, newPassword);
@@ -2733,11 +2805,20 @@ function createMcpServer(env, ctx, origin) {
       title: 'Append to note',
       description:
         'Add text to the end of a note. Use when the user wants to add, append, or continue a note ' +
-        'without replacing it. A locked note needs its password. Appending to a missing id creates it.',
+        'without replacing it. A locked note needs its password. Appending to a missing id creates it. ' +
+        'Omit expires to keep the current expiry.',
       inputSchema: z.object({
         id: mcpIdInput,
         text: z.string().describe('Text to add to the end of the note.'),
         password: mcpPasswordInput,
+        expires: z
+          .string()
+          .optional()
+          .describe(
+            'Note expiry in the same write. ' +
+              EXPIRY_HINT +
+              ' Omit it to keep the current expiry (a new note uses the server default).',
+          ),
       }),
       outputSchema: z.object({
         id: mcpIdInput.describe('Note id that was appended to.'),
@@ -2754,15 +2835,27 @@ function createMcpServer(env, ctx, origin) {
         openWorldHint: false,
       },
     },
-    async ({ id, text, password }) => {
+    async ({ id, text, password, expires }) => {
       const found = await loadNoteMeta(env, id);
       const row = found ? found.row : null;
       if (isProtectedRow(row)) {
         if (!password) return mcpFail(mcpLockedText(id));
         if (!(await verifyPassword(password, row))) return mcpFail(mcpWrongPasswordText(id));
       }
+      let resolvedExpiry;
+      if (expires !== undefined) {
+        resolvedExpiry = resolveExpiryToken(expires);
+        if (resolvedExpiry === undefined) {
+          return mcpFail(
+            `Unknown expiry '${expires}'. ${EXPIRY_HINT} Nothing was saved.`,
+          );
+        }
+      }
       const isNew = !row || !!(found && found.expired);
-      const saved = await saveNote(env, id, text, { append: true });
+      const saved = await saveNote(env, id, text, {
+        append: true,
+        expires: resolvedExpiry,
+      });
       return mcpOk(
         (isNew
           ? `Note '${id}' was created with the appended text.`
@@ -2819,13 +2912,10 @@ function createMcpServer(env, ctx, origin) {
     {
       title: 'Set note expiry',
       description:
-        'Change only when a note expires, keeping its text. Use when the user wants a note ' +
-        'to live for 24 hours, 72 hours, 1 week, or to never expire. A locked note needs its password.',
+        'Change only when a note expires, keeping its text. A locked note needs its password.',
       inputSchema: z.object({
         id: mcpIdInput,
-        token: z
-          .enum(['24h', '72h', '1w', 'never'])
-          .describe("New expiry: '24h', '72h', '1w', or 'never'."),
+        token: z.string().describe(`New expiry. ${EXPIRY_HINT}`),
         password: mcpPasswordInput,
       }),
       outputSchema: z.object({
@@ -2849,7 +2939,13 @@ function createMcpServer(env, ctx, origin) {
         if (!password) return mcpFail(mcpLockedText(id));
         if (!(await verifyPassword(password, row))) return mcpFail(mcpWrongPasswordText(id));
       }
-      const saved = await setNoteExpiry(env, id, resolveExpiryToken(token));
+      const expires = resolveExpiryToken(token);
+      if (expires === undefined) {
+        return mcpFail(
+          `Unknown expiry '${token}'. ${EXPIRY_HINT} Nothing changed.`,
+        );
+      }
+      const saved = await setNoteExpiry(env, id, expires);
       if (!saved) return mcpFail(mcpMissingText(id));
       return mcpOk(
         saved.expiresAt == null

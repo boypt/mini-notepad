@@ -25,7 +25,7 @@ Trigger. No runtime dependencies; `wrangler` is the only dev dependency.
   against a running Worker.
 - Helpers are exported specifically so they can be imported and exercised by
   plain Node: `randomNoteId`, `compress`, `encodeForStorage`,
-  `resolveExpiryToken`, `decompress`, `renderPage`.
+  `resolveExpiryToken`, `parseExpiryDuration`, `decompress`, `renderPage`.
 
 ## Commands
 

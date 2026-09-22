@@ -143,7 +143,7 @@ curl http://127.0.0.1:8787/cli-test            # hello world
 
 # Change only the expiry from the command line. POST to /:note/expire, so the
 # body stays the same. The receipt shows "status": "expiry set" and the new
-# Expires. It accepts 24h, 72h, 1w, or never.
+# Expires. It accepts `never` or any duration (`24h`, `90m`, `30d`, `6mo`).
 curl -d 'expires=24h'   http://127.0.0.1:8787/cli-test/expire
 curl -d 'expires=never' http://127.0.0.1:8787/cli-test/expire
 
@@ -318,9 +318,11 @@ deploy once so Cloudflare updates the trigger.
 
 ### How expiry works
 
-The user picks an expiry in the status bar: `24h`, `72h`, `1w`, or `never`. The
-page sends it in the `expires` field when it creates a note and when the menu
-changes. An explicit choice sets `expires_at = now + the choice`; a normal
+The user picks an expiry in the status bar: `24h`, `72h`, `1w`, or `never`.
+The web page shows only these four, but the API takes `never` or any
+duration (`90m`, `36h`, `30d`, `6mo`, `1y`, or mixed like `1w2d`). The page
+sends the choice in the `expires` field when it creates a note and when the
+menu changes. An explicit choice sets `expires_at = now + the choice`; a normal
 content save keeps the current expiry. So a note expires after the chosen
 period from the last menu change or creation. A CLI `POST /:note/expire`
 (`curl -d 'expires=24h' .../my-note/expire`) changes the expiry only; the body
@@ -412,6 +414,19 @@ Check that `public/favicon.ico` exists and that `[assets]` in `wrangler.toml`
 points to `./public`. Static files and Worker routes share the domain. Only
 requests that do not match a file go to the Worker.
 
+**MCP returns `-32601 Method not found`**
+You called the tool name as the method (for example `"method":"write_note"`).
+That is wrong. MCP tools run through `"method":"tools/call"` with the tool
+name in `params.name`. See section 15 for a good example.
+
+**MCP returns `403 Error 1010`**
+This block comes from Cloudflare WAF in front of the Worker, not from
+`src/index.js`. The Worker never returns `403` for `/mcp`. Error `1010`
+(`browser_signature_banned`) means Cloudflare blocked the client user agent
+(for example `Python-urllib`). Chinese text or emoji is not the cause. A quick
+test is to send the same text with a `curl` user agent: it passes. See
+section 15 for how to let `/mcp` pass the WAF.
+
 ---
 
 ## 14. Security and privacy
@@ -464,10 +479,10 @@ Six tools:
 | Tool | What it does |
 | --- | --- |
 | `read_note` | Reads a note. Long notes are cut (default 25000 chars). |
-| `write_note` | Creates or replaces a note. No `id` makes a new random ID. |
-| `append_note` | Adds text to the end of a note. |
+| `write_note` | Creates or replaces a note. No `id` makes a new random ID. Can set `expires` (`24h`, `72h`, `1w`, `never`) and `newPassword` in the same call. |
+| `append_note` | Adds text to the end of a note. Can set `expires` in the same call. |
 | `delete_note` | Deletes a note forever. |
-| `set_expiry` | Changes only the expiry (`24h`, `72h`, `1w`, `never`). |
+| `set_expiry` | Changes only the expiry (`never` or any duration like `30d`). |
 | `set_password` | Sets, changes, or removes the note password. |
 
 Add it to your client. You only need the URL. No headers, no keys.
@@ -513,3 +528,33 @@ curl -s -H 'Content-Type: application/json' \
 ```
 
 `GET /mcp` and `DELETE /mcp` return `405`. Only `POST /mcp` works.
+
+### Let `/mcp` pass Cloudflare WAF
+
+`wrangler` cannot change WAF rules. Use the dashboard. `wrangler.toml` has no
+WAF setting.
+
+Cloudflare WAF runs before the Worker. It can block API clients with `403
+Error 1010` (`browser_signature_banned`). This is a user-agent block, not a
+content block.
+
+Steps:
+
+1. Open the dashboard for your zone (your domain, not the Worker).
+2. Go to Security → Events. Find the blocked request by its `ray_id`.
+   It shows which rule blocked it.
+3. Go to Security → WAF → Custom rules. Add a rule:
+   - Field: `URI Path`, Operator: `equals`, Value: `/mcp`.
+   - Action: `Skip`. Skip all managed rules and checks for this path.
+4. Deploy the rule. Test again with `tools/call`.
+
+Notes:
+
+- Keep Browser Integrity Check and Bot Fight Mode on for the rest of the
+  site. Skip them only for `/mcp`.
+- The dashboard message `This Worker is not protected by Access` is normal.
+  Access is a login wall. `/mcp` has no login by design, so keep it
+  unprotected. If you turn Access on, MCP clients will fail.
+- Client side, send a normal user agent (for example `curl`) with these
+  headers: `Content-Type: application/json` and
+  `Accept: application/json, text/event-stream`.
